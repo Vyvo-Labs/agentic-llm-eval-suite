@@ -19,6 +19,10 @@ def _split_repeated(values: list[str] | None) -> list[str]:
     return parsed
 
 
+def _page_assets_dir(html_path: Path) -> Path:
+    return html_path.parent / f"{html_path.stem}_assets"
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Env-driven LLM benchmark + judge suite")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -104,6 +108,12 @@ def _run_command(args: argparse.Namespace) -> int:
 
     print(f"Benchmark run completed: {run_dir}")
     print(f"Reports: {run_dir / 'leaderboard.md'} and {run_dir / 'leaderboard.html'}")
+    leaderboard_assets = _page_assets_dir(run_dir / "leaderboard.html")
+    history_assets = _page_assets_dir(config.output_dir / "history.html")
+    if leaderboard_assets.exists():
+        print(f"Leaderboard page assets: {leaderboard_assets}")
+    if history_assets.exists():
+        print(f"History page assets: {history_assets}")
     print(f"Model count: {len(results.model_summaries)}")
     print(f"Case results: {len(results.case_results)}")
     if results.warnings:
@@ -145,6 +155,9 @@ def _report_command(args: argparse.Namespace) -> int:
     )
     print(f"Wrote markdown report: {markdown_output}")
     print(f"Wrote HTML report: {html_output}")
+    assets_dir = _page_assets_dir(html_output)
+    if assets_dir.exists():
+        print(f"Wrote page assets: {assets_dir}")
     return 0
 
 
@@ -153,6 +166,9 @@ def _history_command(args: argparse.Namespace) -> int:
     reports_root = args.reports_dir or config.output_dir
     history_output = write_history_report(reports_root, args.output)
     print(f"Wrote history dashboard: {history_output}")
+    assets_dir = _page_assets_dir(history_output)
+    if assets_dir.exists():
+        print(f"Wrote page assets: {assets_dir}")
     return 0
 
 

@@ -16,8 +16,12 @@ scores from deterministic checks plus optional LLM-judge rubric scoring.
   - `results.json`
   - `leaderboard.md`
   - `leaderboard.html`
+  - `leaderboard_assets/leaderboard.pdf`
+  - `leaderboard_assets/leaderboard.png`
   - `raw_responses.jsonl`
   - `reports/history.html` (day-by-day dashboard across runs with historical leaderboard + winner metrics)
+  - `reports/history_assets/history.pdf`
+  - `reports/history_assets/history.png`
 
 ## Install
 
@@ -143,6 +147,7 @@ Default OpenRouter preset models:
 - `EVAL_CACHE_ENABLED` (`true` by default)
 - `EVAL_CACHE_DIR` (default: `.cache/llm_eval_suite`)
 - `EVAL_OUTPUT_DIR` (default: `reports`)
+- `EVAL_EXPORT_PAGE_ASSETS` (`true` by default; set `0`/`false` to disable HTML->PDF/PNG export)
 
 ### Judge model
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 from llm_eval_suite.report import (
@@ -146,6 +147,58 @@ def test_write_html_report_handles_empty_models(tmp_path: Path) -> None:
 
     assert "No model results were generated." in html_text
     assert "<h2>Explanation</h2>" in html_text
+
+
+def test_write_html_report_writes_pdf_and_png_assets_when_enabled(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("EVAL_EXPORT_PAGE_ASSETS", "1")
+    monkeypatch.setattr("llm_eval_suite.report.shutil.which", lambda binary: "/usr/bin/playwright")
+
+    commands: list[list[str]] = []
+
+    def _fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        Path(command[3]).parent.mkdir(parents=True, exist_ok=True)
+        Path(command[3]).write_text("asset", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("llm_eval_suite.report.subprocess.run", _fake_run)
+
+    html_path = tmp_path / "leaderboard.html"
+    write_html_report(_sample_results(), html_path)
+
+    assets_dir = tmp_path / "leaderboard_assets"
+    assert (assets_dir / "leaderboard.pdf").exists()
+    assert (assets_dir / "leaderboard.png").exists()
+    assert len(commands) == 2
+    assert commands[0][1] == "pdf"
+    assert commands[1][1] == "screenshot"
+
+
+def test_write_history_report_writes_pdf_and_png_assets_when_enabled(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("EVAL_EXPORT_PAGE_ASSETS", "1")
+    monkeypatch.setattr("llm_eval_suite.report.shutil.which", lambda binary: "/usr/bin/playwright")
+
+    def _fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        Path(command[3]).parent.mkdir(parents=True, exist_ok=True)
+        Path(command[3]).write_text("asset", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("llm_eval_suite.report.subprocess.run", _fake_run)
+
+    reports_root = tmp_path / "reports"
+    reports_root.mkdir(parents=True)
+    output_path = write_history_report(reports_root)
+
+    assert output_path == reports_root / "history.html"
+    assets_dir = reports_root / "history_assets"
+    assert (assets_dir / "history.pdf").exists()
+    assert (assets_dir / "history.png").exists()
 
 
 def test_write_history_report_groups_runs_day_by_day_and_computes_winner_mean(tmp_path: Path) -> None:

@@ -3,6 +3,9 @@ from __future__ import annotations
 import html
 import json
 import math
+import os
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +59,82 @@ def _sort_value(value: float | None) -> str:
     if value is None:
         return ""
     return f"{value:.12f}"
+
+
+def _is_page_asset_export_enabled() -> bool:
+    raw = (os.getenv("EVAL_EXPORT_PAGE_ASSETS") or "").strip().lower()
+    if not raw:
+        return True
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _resolve_playwright_command() -> list[str] | None:
+    if shutil.which("playwright"):
+        return ["playwright"]
+    if shutil.which("npx"):
+        return ["npx", "--yes", "playwright"]
+    return None
+
+
+def _page_assets_dir_for_html(output_path: Path) -> Path:
+    return output_path.parent / f"{output_path.stem}_assets"
+
+
+def _export_page_assets(html_output_path: Path) -> None:
+    if not _is_page_asset_export_enabled():
+        return
+
+    playwright_command = _resolve_playwright_command()
+    if not playwright_command:
+        return
+
+    assets_dir = _page_assets_dir_for_html(html_output_path)
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    page_uri = html_output_path.resolve().as_uri()
+
+    commands = [
+        (
+            assets_dir / f"{html_output_path.stem}.pdf",
+            [
+                *playwright_command,
+                "pdf",
+                page_uri,
+                str(assets_dir / f"{html_output_path.stem}.pdf"),
+                "--paper-format",
+                "A4",
+                "--wait-for-timeout",
+                "1200",
+            ],
+        ),
+        (
+            assets_dir / f"{html_output_path.stem}.png",
+            [
+                *playwright_command,
+                "screenshot",
+                page_uri,
+                str(assets_dir / f"{html_output_path.stem}.png"),
+                "--full-page",
+                "--wait-for-timeout",
+                "1200",
+            ],
+        ),
+    ]
+
+    rendered_any = False
+    for target, command in commands:
+        try:
+            subprocess.run(command, check=True, capture_output=True, text=True)
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            # Rendering is best-effort and should not block report generation.
+            continue
+        if target.exists():
+            rendered_any = True
+
+    if not rendered_any:
+        try:
+            assets_dir.rmdir()
+        except OSError:
+            pass
 
 
 def _infer_provider_label(summary: dict[str, Any]) -> str:
@@ -1339,6 +1418,7 @@ def write_markdown_report(results: dict[str, Any], output_path: Path) -> None:
 def write_html_report(results: dict[str, Any], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(render_leaderboard_html(results), encoding="utf-8")
+    _export_page_assets(output_path)
 
 
 def write_reports(results: dict[str, Any], markdown_output_path: Path, html_output_path: Path) -> None:
@@ -1350,6 +1430,7 @@ def write_history_report(reports_root: Path, output_path: Path | None = None) ->
     target = output_path or (reports_root / "history.html")
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(render_history_html(reports_root), encoding="utf-8")
+    _export_page_assets(target)
     return target
 
 
