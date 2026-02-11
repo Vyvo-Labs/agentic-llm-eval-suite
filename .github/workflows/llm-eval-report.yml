@@ -1,0 +1,42 @@
+name: LLM Eval Report
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+jobs:
+  llm-eval-report:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run non-blocking benchmark sample
+        id: benchmark
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          EVAL_PROVIDER_PRESET: openai
+          EVAL_JUDGE_PROVIDER: openai
+          EVAL_JUDGE_MODEL: gpt-5-mini
+          EVAL_CI_MAX_CASES: "2"
+        run: bash scripts/ci_benchmark.sh
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: llm-eval-reports
+          path: reports/
+          if-no-files-found: ignore

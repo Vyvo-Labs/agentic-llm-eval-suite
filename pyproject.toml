@@ -1,0 +1,31 @@
+[project]
+name = "llm-eval-suite"
+version = "0.1.0"
+description = "Env-driven LLM benchmark and judge suite"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "openai>=1.59.0",
+    "pyyaml>=6.0.2",
+]
+
+[project.scripts]
+eval-suite = "llm_eval_suite.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.4",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["llm_eval_suite"]
+
+[tool.uv]
+package = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
