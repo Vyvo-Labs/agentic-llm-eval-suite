@@ -295,13 +295,13 @@ def load_config(dotenv_path: Path | None = None) -> EvalConfig:
         reasoning_effort=_parse_optional_str(env.get("EVAL_REASONING_EFFORT") or env.get("LLM_REASONING_EFFORT")),
         temperature=_parse_optional_float(env.get("EVAL_TEMPERATURE")),
         judge_provider=(env.get("EVAL_JUDGE_PROVIDER") or "openai").strip().lower(),
-        judge_model=(env.get("EVAL_JUDGE_MODEL") or "gpt-5-mini").strip(),
+        judge_model=(env.get("EVAL_JUDGE_MODEL") or "gpt-5.2").strip(),
         judge_base_url=_parse_optional_str(env.get("EVAL_JUDGE_BASE_URL")),
         judge_api_key=_parse_optional_str(env.get("EVAL_JUDGE_API_KEY")),
         judge_timeout_s=max(1.0, _parse_float(env.get("EVAL_JUDGE_TIMEOUT_S"), 90.0)),
         judge_max_completion_tokens=max(1, _parse_int(env.get("EVAL_JUDGE_MAX_COMPLETION_TOKENS"), 400)),
         judge_reasoning_effort=_parse_optional_str(
-            env.get("EVAL_JUDGE_REASONING_EFFORT") or env.get("LLM_REASONING_EFFORT")
+            env.get("EVAL_JUDGE_REASONING_EFFORT") or env.get("LLM_REASONING_EFFORT") or "xhigh"
         ),
     )
 

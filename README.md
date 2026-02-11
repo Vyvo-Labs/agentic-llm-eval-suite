@@ -141,12 +141,12 @@ Default OpenRouter preset models:
 ### Judge model
 
 - `EVAL_JUDGE_PROVIDER` (default: `openai`)
-- `EVAL_JUDGE_MODEL` (default: `gpt-5-mini`)
+- `EVAL_JUDGE_MODEL` (default: `gpt-5.2`)
 - `EVAL_JUDGE_BASE_URL` (optional)
 - `EVAL_JUDGE_API_KEY` (optional override; otherwise provider key is used)
 - `EVAL_JUDGE_TIMEOUT_S` (default: `90`)
 - `EVAL_JUDGE_MAX_COMPLETION_TOKENS` (default: `400`)
-- `EVAL_JUDGE_REASONING_EFFORT`
+- `EVAL_JUDGE_REASONING_EFFORT` (default: `xhigh`)
 
 ### Provider keys
 

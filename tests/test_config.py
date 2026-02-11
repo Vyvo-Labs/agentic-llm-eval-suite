@@ -137,3 +137,17 @@ def test_load_config_defaults_to_all_models_per_provider_limit_of_20(
 
     config = load_config(dotenv_path)
     assert config.max_models_per_provider == 20
+
+
+def test_load_config_defaults_judge_to_gpt_5_2_xhigh(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    _clear_relevant_env(monkeypatch)
+    dotenv_path = tmp_path / ".env"
+    dotenv_path.write_text("", encoding="utf-8")
+
+    config = load_config(dotenv_path)
+    assert config.judge_provider == "openai"
+    assert config.judge_model == "gpt-5.2"
+    assert config.judge_reasoning_effort == "xhigh"
