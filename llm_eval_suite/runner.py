@@ -27,7 +27,7 @@ from .models import (
     UsageStats,
 )
 from .providers import LLMEndpoint, ResolvedModels, resolve_candidate_models, resolve_judge_endpoint
-from .report import write_reports
+from .report import write_history_report, write_reports
 from .scoring import combine_scores, evaluate_deterministic
 
 PASS_THRESHOLD = 0.8
@@ -745,5 +745,7 @@ def persist_run_results(results: RunResults, output_dir: Path) -> Path:
                 )
             )
             handle.write("\n")
+
+    write_history_report(output_dir)
 
     return run_dir

@@ -36,6 +36,28 @@ def _clamp(value: float, minimum: float, maximum: float) -> float:
     return min(maximum, max(minimum, value))
 
 
+def _mean(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _sort_value(value: float | None) -> str:
+    if value is None:
+        return ""
+    return f"{value:.12f}"
+
+
 def _sorted_model_summaries(results: dict[str, Any]) -> list[dict[str, Any]]:
     model_summaries = list(results.get("model_summaries", []))
     model_summaries.sort(
@@ -53,6 +75,609 @@ def _sorted_failed_cases(results: dict[str, Any]) -> list[dict[str, Any]]:
     ]
     failed_cases.sort(key=lambda item: _as_float(item.get("final_score")) or 0.0)
     return failed_cases
+
+
+def _derive_day_key(*, started_at: str, run_dir_name: str) -> str:
+    if len(started_at) >= 10 and started_at[4:5] == "-" and started_at[7:8] == "-":
+        return started_at[:10]
+    if len(run_dir_name) >= 8 and run_dir_name[:8].isdigit():
+        raw = run_dir_name[:8]
+        return f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
+    return "unknown"
+
+
+def _load_history_entries(reports_root: Path) -> list[dict[str, Any]]:
+    if not reports_root.exists():
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for child in sorted(reports_root.iterdir()):
+        if not child.is_dir():
+            continue
+
+        results_path = child / "results.json"
+        if not results_path.exists():
+            continue
+
+        try:
+            payload = json.loads(results_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            continue
+
+        model_summaries = _sorted_model_summaries(payload)
+        normalized_summaries: list[dict[str, Any]] = []
+        for summary in model_summaries:
+            model_name = str(summary.get("model_name", "")).strip()
+            if not model_name:
+                continue
+            normalized_summaries.append(
+                {
+                    "model_name": model_name,
+                    "final_score_avg": _as_float(summary.get("final_score_avg")),
+                    "pass_rate": _as_float(summary.get("pass_rate")),
+                    "deterministic_score_avg": _as_float(summary.get("deterministic_score_avg")),
+                    "judge_score_avg": _as_float(summary.get("judge_score_avg")),
+                    "latency_p50_s": _as_float(summary.get("latency_p50_s")),
+                    "ttft_p50_s": _as_float(summary.get("ttft_p50_s")),
+                    "tokens_per_s_p50": _as_float(summary.get("tokens_per_s_p50")),
+                    "error_count": _as_float(summary.get("error_count")),
+                }
+            )
+
+        winner = normalized_summaries[0] if normalized_summaries else {}
+        winner_model = str(winner.get("model_name", "-")) if winner else "-"
+        winner_score = _as_float(winner.get("final_score_avg")) if winner else None
+        started_at = str(payload.get("started_at", ""))
+        finished_at = str(payload.get("finished_at", ""))
+        run_id = str(payload.get("run_id", "")) or child.name
+        day_key = _derive_day_key(started_at=started_at, run_dir_name=child.name)
+
+        entries.append(
+            {
+                "run_dir_name": child.name,
+                "run_id": run_id,
+                "day_key": day_key,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "winner_model": winner_model,
+                "winner_score": winner_score,
+                "case_count": len(payload.get("case_results", [])),
+                "model_count": len(normalized_summaries),
+                "warning_count": len(payload.get("warnings", [])),
+                "model_summaries": normalized_summaries,
+            }
+        )
+
+    entries.sort(
+        key=lambda item: (
+            str(item.get("started_at", "")),
+            str(item.get("run_dir_name", "")),
+        ),
+        reverse=True,
+    )
+    return entries
+
+
+def _build_history_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    report_count = len(entries)
+    winner_total_score = sum((entry.get("winner_score") or 0.0) for entry in entries)
+    mean_winner_score = (winner_total_score / report_count) if report_count else None
+
+    winner_by_model: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        model_name = str(entry.get("winner_model", "-"))
+        winner_score = _as_float(entry.get("winner_score"))
+        if winner_score is None:
+            continue
+        state = winner_by_model.setdefault(
+            model_name,
+            {"model_name": model_name, "wins": 0, "total_score": 0.0},
+        )
+        state["wins"] += 1
+        state["total_score"] += winner_score
+
+    winner_rows: list[dict[str, Any]] = []
+    for row in winner_by_model.values():
+        wins = int(row["wins"])
+        total_score = float(row["total_score"])
+        winner_rows.append(
+            {
+                "model_name": row["model_name"],
+                "wins": wins,
+                "total_score": total_score,
+                "mean_when_winner": (total_score / wins) if wins else None,
+                "mean_per_report": (total_score / report_count) if report_count else None,
+            }
+        )
+    winner_rows.sort(
+        key=lambda item: (_as_float(item.get("mean_per_report")) or 0.0, int(item.get("wins") or 0)),
+        reverse=True,
+    )
+
+    historical_by_model: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        winner_model = str(entry.get("winner_model", "-"))
+        model_summaries = entry.get("model_summaries", [])
+        for summary in model_summaries:
+            model_name = str(summary.get("model_name", "-"))
+            state = historical_by_model.setdefault(
+                model_name,
+                {
+                    "model_name": model_name,
+                    "reports_seen": 0,
+                    "wins": 0,
+                    "final_scores": [],
+                    "pass_rates": [],
+                    "deterministic_scores": [],
+                    "judge_scores": [],
+                    "latency_p50_values": [],
+                    "ttft_p50_values": [],
+                    "tokens_per_s_p50_values": [],
+                    "error_total": 0,
+                },
+            )
+            state["reports_seen"] += 1
+            if model_name == winner_model:
+                state["wins"] += 1
+
+            final_score = _as_float(summary.get("final_score_avg"))
+            pass_rate = _as_float(summary.get("pass_rate"))
+            deterministic_score = _as_float(summary.get("deterministic_score_avg"))
+            judge_score = _as_float(summary.get("judge_score_avg"))
+            latency_p50 = _as_float(summary.get("latency_p50_s"))
+            ttft_p50 = _as_float(summary.get("ttft_p50_s"))
+            tokens_per_s_p50 = _as_float(summary.get("tokens_per_s_p50"))
+            error_count = _as_float(summary.get("error_count"))
+
+            if final_score is not None:
+                state["final_scores"].append(final_score)
+            if pass_rate is not None:
+                state["pass_rates"].append(pass_rate)
+            if deterministic_score is not None:
+                state["deterministic_scores"].append(deterministic_score)
+            if judge_score is not None:
+                state["judge_scores"].append(judge_score)
+            if latency_p50 is not None:
+                state["latency_p50_values"].append(latency_p50)
+            if ttft_p50 is not None:
+                state["ttft_p50_values"].append(ttft_p50)
+            if tokens_per_s_p50 is not None:
+                state["tokens_per_s_p50_values"].append(tokens_per_s_p50)
+            if error_count is not None:
+                state["error_total"] += int(error_count)
+
+    historical_leaderboard_rows: list[dict[str, Any]] = []
+    for state in historical_by_model.values():
+        reports_seen = int(state["reports_seen"])
+        wins = int(state["wins"])
+        final_scores = [float(item) for item in state["final_scores"]]
+        total_final_score = sum(final_scores)
+        historical_leaderboard_rows.append(
+            {
+                "model_name": state["model_name"],
+                "reports_seen": reports_seen,
+                "wins": wins,
+                "win_rate_global": (wins / report_count) if report_count else None,
+                "win_rate_seen": (wins / reports_seen) if reports_seen else None,
+                "total_final_score": total_final_score,
+                "mean_final_score": _mean(final_scores),
+                "median_final_score": _median(final_scores),
+                "mean_pass_rate": _mean([float(item) for item in state["pass_rates"]]),
+                "mean_deterministic_score": _mean([float(item) for item in state["deterministic_scores"]]),
+                "mean_judge_score": _mean([float(item) for item in state["judge_scores"]]),
+                "mean_latency_p50_s": _mean([float(item) for item in state["latency_p50_values"]]),
+                "mean_ttft_p50_s": _mean([float(item) for item in state["ttft_p50_values"]]),
+                "mean_tokens_per_s_p50": _mean([float(item) for item in state["tokens_per_s_p50_values"]]),
+                "mean_error_count": ((state["error_total"] / reports_seen) if reports_seen else None),
+            }
+        )
+    historical_leaderboard_rows.sort(
+        key=lambda item: (
+            _as_float(item.get("mean_final_score")) or 0.0,
+            _as_float(item.get("win_rate_global")) or 0.0,
+            int(item.get("wins") or 0),
+        ),
+        reverse=True,
+    )
+
+    grouped_days: dict[str, list[dict[str, Any]]] = {}
+    for entry in entries:
+        grouped_days.setdefault(str(entry.get("day_key", "unknown")), []).append(entry)
+    day_rows = sorted(grouped_days.items(), key=lambda item: item[0], reverse=True)
+
+    return {
+        "report_count": report_count,
+        "day_count": len(day_rows),
+        "winner_total_score": winner_total_score,
+        "mean_winner_score": mean_winner_score,
+        "winner_model_count": len(winner_rows),
+        "winner_rows": winner_rows,
+        "historical_leaderboard_rows": historical_leaderboard_rows,
+        "day_rows": day_rows,
+    }
+
+
+def _render_sortable_tables_script_lines() -> list[str]:
+    return [
+        "<script>",
+        "(function () {",
+        "  function normalize(raw) {",
+        "    if (raw === null || raw === undefined) return '';",
+        "    return String(raw).trim();",
+        "  }",
+        "  function asNumber(raw) {",
+        "    var text = normalize(raw).replace(/[%,$]/g, '');",
+        "    if (!text || text === '-') return null;",
+        "    var value = Number(text);",
+        "    return Number.isFinite(value) ? value : null;",
+        "  }",
+        "  function asDate(raw) {",
+        "    var text = normalize(raw);",
+        "    if (!text || text === '-') return null;",
+        "    var value = Date.parse(text);",
+        "    return Number.isFinite(value) ? value : null;",
+        "  }",
+        "  function cellValue(row, index, type) {",
+        "    var cell = row.children[index];",
+        "    if (!cell) return null;",
+        "    var raw = cell.getAttribute('data-sort-value');",
+        "    if (raw === null) raw = cell.textContent;",
+        "    if (type === 'number' || type === 'percent') return asNumber(raw);",
+        "    if (type === 'date') return asDate(raw);",
+        "    var text = normalize(raw);",
+        "    return text ? text.toLowerCase() : null;",
+        "  }",
+        "  function setHeaderState(headers, active, order) {",
+        "    headers.forEach(function (header) {",
+        "      header.classList.remove('sorted-asc', 'sorted-desc');",
+        "      header.dataset.sortOrder = 'none';",
+        "      header.setAttribute('aria-sort', 'none');",
+        "    });",
+        "    active.classList.add(order === 'asc' ? 'sorted-asc' : 'sorted-desc');",
+        "    active.dataset.sortOrder = order;",
+        "    active.setAttribute('aria-sort', order === 'asc' ? 'ascending' : 'descending');",
+        "  }",
+        "  function updateRankColumn(tbody) {",
+        "    var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));",
+        "    rows.forEach(function (row, index) {",
+        "      var rankCell = row.querySelector('td.col-rank');",
+        "      if (!rankCell) return;",
+        "      var rank = index + 1;",
+        "      rankCell.textContent = String(rank);",
+        "      rankCell.setAttribute('data-sort-value', String(rank));",
+        "    });",
+        "  }",
+        "  function sortTable(table, headers, index, order) {",
+        "    var tbody = table.querySelector('tbody');",
+        "    if (!tbody) return;",
+        "    var header = headers[index];",
+        "    var type = header.dataset.sortType || 'text';",
+        "    var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr')).map(function (row, i) {",
+        "      return { row: row, originalIndex: i };",
+        "    });",
+        "    rows.sort(function (a, b) {",
+        "      var aValue = cellValue(a.row, index, type);",
+        "      var bValue = cellValue(b.row, index, type);",
+        "      if (aValue === null && bValue === null) return a.originalIndex - b.originalIndex;",
+        "      if (aValue === null) return 1;",
+        "      if (bValue === null) return -1;",
+        "      if (aValue < bValue) return order === 'asc' ? -1 : 1;",
+        "      if (aValue > bValue) return order === 'asc' ? 1 : -1;",
+        "      return a.originalIndex - b.originalIndex;",
+        "    });",
+        "    rows.forEach(function (entry) { tbody.appendChild(entry.row); });",
+        "    updateRankColumn(tbody);",
+        "    setHeaderState(headers, header, order);",
+        "  }",
+        "  function toggleSort(table, headers, index) {",
+        "    var header = headers[index];",
+        "    var nextOrder = header.dataset.sortOrder === 'asc' ? 'desc' : 'asc';",
+        "    sortTable(table, headers, index, nextOrder);",
+        "  }",
+        "  document.querySelectorAll('table.sortable').forEach(function (table) {",
+        "    var headers = Array.prototype.slice.call(table.querySelectorAll('thead th'));",
+        "    headers.forEach(function (header, index) {",
+        "      if (!header.dataset.sortType) return;",
+        "      header.classList.add('sortable-header');",
+        "      header.dataset.sortOrder = 'none';",
+        "      header.setAttribute('aria-sort', 'none');",
+        "      header.setAttribute('role', 'button');",
+        "      header.setAttribute('tabindex', '0');",
+        "      header.setAttribute('title', 'Sort rows by this column');",
+        "      header.addEventListener('click', function () {",
+        "        toggleSort(table, headers, index);",
+        "      });",
+        "      header.addEventListener('keydown', function (event) {",
+        "        if (event.key === 'Enter' || event.key === ' ') {",
+        "          event.preventDefault();",
+        "          toggleSort(table, headers, index);",
+        "        }",
+        "      });",
+        "    });",
+        "    var defaultColumn = Number(table.dataset.defaultSortColumn || '-1');",
+        "    var defaultOrder = table.dataset.defaultSortOrder === 'asc' ? 'asc' : 'desc';",
+        "    if (Number.isInteger(defaultColumn) && defaultColumn >= 0 && defaultColumn < headers.length) {",
+        "      if (headers[defaultColumn].dataset.sortType) {",
+        "        sortTable(table, headers, defaultColumn, defaultOrder);",
+        "      }",
+        "    }",
+        "  });",
+        "})();",
+        "</script>",
+    ]
+
+
+def render_history_html(reports_root: Path) -> str:
+    entries = _load_history_entries(reports_root)
+    metrics = _build_history_metrics(entries)
+    report_count = int(metrics["report_count"])
+    day_count = int(metrics["day_count"])
+    winner_total_score = float(metrics["winner_total_score"])
+    mean_winner_score = _as_float(metrics["mean_winner_score"])
+    winner_model_count = int(metrics["winner_model_count"])
+    winner_rows = list(metrics["winner_rows"])
+    historical_leaderboard_rows = list(metrics["historical_leaderboard_rows"])
+    day_rows = list(metrics["day_rows"])
+
+    lines: list[str] = [
+        "<!doctype html>",
+        '<html lang="en">',
+        "<head>",
+        '<meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        "<title>LLM Eval Reports History</title>",
+        "<style>",
+        ":root { color-scheme: light; }",
+        "body { margin: 0; font-family: 'Avenir Next', Avenir, 'Segoe UI', sans-serif; background: #f5f7fb; color: #1f2937; }",
+        ".page { max-width: 1200px; margin: 0 auto; padding: 24px; }",
+        ".hero { background: linear-gradient(120deg, #0f172a, #1d4ed8); color: #f8fafc; border-radius: 18px; padding: 24px; box-shadow: 0 10px 30px rgba(15, 23, 42, 0.25); }",
+        ".hero h1 { margin: 0; font-size: 2rem; }",
+        ".hero p { margin: 10px 0 0; opacity: 0.94; }",
+        ".meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin-top: 16px; }",
+        ".meta-card { background: rgba(255,255,255,0.14); border: 1px solid rgba(255,255,255,0.18); border-radius: 12px; padding: 10px 12px; }",
+        ".section { margin-top: 22px; background: #ffffff; border-radius: 14px; padding: 18px; box-shadow: 0 5px 16px rgba(2, 6, 23, 0.08); }",
+        "h2 { margin: 0 0 12px 0; font-size: 1.25rem; color: #111827; }",
+        "h3 { margin: 0 0 10px 0; font-size: 1.05rem; }",
+        ".muted { color: #6b7280; margin: 0 0 8px 0; }",
+        ".table-wrap { overflow-x: auto; border: 1px solid #e5e7eb; border-radius: 12px; background: #ffffff; }",
+        "table { width: max-content; min-width: 100%; border-collapse: collapse; font-size: 0.93rem; }",
+        "th, td { text-align: left; border-bottom: 1px solid #e5e7eb; padding: 10px 8px; vertical-align: top; white-space: nowrap; }",
+        "th { background: #f8fafc; color: #111827; }",
+        ".mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }",
+        ".sticky-col { position: sticky; left: 0; background: #ffffff; z-index: 2; }",
+        "th.sticky-col { background: #f8fafc; z-index: 3; }",
+        ".col-rank { min-width: 56px; }",
+        ".col-model { min-width: 320px; }",
+        ".chart-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }",
+        ".chart { border: 1px solid #e5e7eb; border-radius: 12px; padding: 12px; background: #fbfdff; }",
+        ".chart-row { margin: 8px 0; }",
+        ".chart-row-top { display: flex; justify-content: space-between; gap: 12px; font-size: 0.9rem; }",
+        ".bar { margin-top: 6px; height: 10px; border-radius: 999px; background: #e5e7eb; overflow: hidden; }",
+        ".fill { display: block; height: 100%; background: linear-gradient(90deg, #22c55e, #2563eb); }",
+        ".sortable th { user-select: none; }",
+        ".sortable th.sortable-header { cursor: pointer; position: relative; padding-right: 18px; }",
+        ".sortable th.sortable-header::after { content: '↕'; position: absolute; right: 6px; color: #94a3b8; font-size: 0.8rem; }",
+        ".sortable th.sorted-asc::after { content: '↑'; color: #2563eb; }",
+        ".sortable th.sorted-desc::after { content: '↓'; color: #2563eb; }",
+        ".day-block { margin-top: 16px; }",
+        ".day-title { margin: 0 0 8px 0; font-size: 1rem; color: #1f2937; }",
+        "a { color: #1d4ed8; text-decoration: none; }",
+        "a:hover { text-decoration: underline; }",
+        "@media (max-width: 640px) { .page { padding: 12px; } .hero h1 { font-size: 1.55rem; } table { font-size: 0.84rem; } }",
+        "</style>",
+        "</head>",
+        "<body>",
+        '<main class="page">',
+        '<section class="hero">',
+        "<h1>LLM Eval Reports History</h1>",
+        "<p>Inspect benchmark runs day by day and compare winner trends.</p>",
+        '<div class="meta-grid">',
+        f'<div class="meta-card"><strong>Report Count</strong><div class="mono">{report_count}</div></div>',
+        f'<div class="meta-card"><strong>Day Count</strong><div class="mono">{day_count}</div></div>',
+        (
+            '<div class="meta-card"><strong>Mean Winner Score</strong>'
+            f'<div class="mono">{_format_num(mean_winner_score)} '
+            f'(total={_format_num(winner_total_score)} / reports={report_count})</div></div>'
+        ),
+        f'<div class="meta-card"><strong>Distinct Winner Models</strong><div class="mono">{winner_model_count}</div></div>',
+        "</div>",
+        "</section>",
+        '<section class="section">',
+        "<h2>Historical Leaderboard</h2>",
+        '<p class="muted">Aggregated model metrics across all reports (not only wins).</p>',
+        '<p class="muted">Click any column header to sort ascending/descending.</p>',
+    ]
+
+    if historical_leaderboard_rows:
+        lines.extend(
+            [
+                '<div class="table-wrap">',
+                '<table class="sortable" data-default-sort-column="5" data-default-sort-order="desc">',
+                "<thead><tr>"
+                '<th class="col-rank" data-sort-type="number">Rank</th><th class="sticky-col col-model" data-sort-type="text">Model</th>'
+                '<th data-sort-type="number">Reports</th><th data-sort-type="number">Wins</th><th data-sort-type="percent">Win Rate (wins/report_count)</th>'
+                '<th data-sort-type="number">Mean Final</th><th data-sort-type="number">Median Final</th><th data-sort-type="percent">Mean Pass Rate</th><th data-sort-type="number">Mean Deterministic</th>'
+                '<th data-sort-type="number">Mean Judge</th><th data-sort-type="number">Mean Latency p50</th><th data-sort-type="number">Mean TTFT p50</th>'
+                '<th data-sort-type="number">Mean Tokens/s p50</th><th data-sort-type="number">Mean Errors/Report</th>'
+                "</tr></thead>",
+                "<tbody>",
+            ]
+        )
+        for rank, row in enumerate(historical_leaderboard_rows, start=1):
+            reports_seen = int(row.get("reports_seen") or 0)
+            wins = int(row.get("wins") or 0)
+            win_rate_global = _as_float(row.get("win_rate_global"))
+            mean_final_score = _as_float(row.get("mean_final_score"))
+            median_final_score = _as_float(row.get("median_final_score"))
+            mean_pass_rate = _as_float(row.get("mean_pass_rate"))
+            mean_deterministic_score = _as_float(row.get("mean_deterministic_score"))
+            mean_judge_score = _as_float(row.get("mean_judge_score"))
+            mean_latency_p50_s = _as_float(row.get("mean_latency_p50_s"))
+            mean_ttft_p50_s = _as_float(row.get("mean_ttft_p50_s"))
+            mean_tokens_per_s_p50 = _as_float(row.get("mean_tokens_per_s_p50"))
+            mean_error_count = _as_float(row.get("mean_error_count"))
+            lines.append(
+                "<tr>"
+                f'<td class="col-rank" data-sort-value="{rank}">{rank}</td>'
+                f'<td class="mono sticky-col col-model">{html.escape(str(row.get("model_name", "-")))}</td>'
+                f'<td data-sort-value="{reports_seen}">{reports_seen}</td>'
+                f'<td data-sort-value="{wins}">{wins}</td>'
+                f'<td data-sort-value="{_sort_value(win_rate_global)}">{_format_pct(win_rate_global)}</td>'
+                f'<td data-sort-value="{_sort_value(mean_final_score)}">{_format_num(mean_final_score)}</td>'
+                f'<td data-sort-value="{_sort_value(median_final_score)}">{_format_num(median_final_score)}</td>'
+                f'<td data-sort-value="{_sort_value(mean_pass_rate)}">{_format_pct(mean_pass_rate)}</td>'
+                f'<td data-sort-value="{_sort_value(mean_deterministic_score)}">{_format_num(mean_deterministic_score)}</td>'
+                f'<td data-sort-value="{_sort_value(mean_judge_score)}">{_format_num(mean_judge_score)}</td>'
+                f'<td data-sort-value="{_sort_value(mean_latency_p50_s)}">{_format_num(mean_latency_p50_s)}</td>'
+                f'<td data-sort-value="{_sort_value(mean_ttft_p50_s)}">{_format_num(mean_ttft_p50_s)}</td>'
+                f'<td data-sort-value="{_sort_value(mean_tokens_per_s_p50)}">{_format_num(mean_tokens_per_s_p50)}</td>'
+                f'<td data-sort-value="{_sort_value(mean_error_count)}">{_format_num(mean_error_count)}</td>'
+                "</tr>"
+            )
+        lines.extend(["</tbody>", "</table>", "</div>"])
+    else:
+        lines.append('<p class="muted">No completed report data found.</p>')
+    lines.append("</section>")
+
+    chart_rows = historical_leaderboard_rows[:12]
+    score_chart = _render_metric_chart_rows(
+        model_summaries=chart_rows,
+        metric_key="mean_final_score",
+        title="Historical Mean Final Score",
+        subtitle="Top models by cross-run average final score.",
+        formatter=_format_num,
+    )
+    win_rate_chart = _render_metric_chart_rows(
+        model_summaries=chart_rows,
+        metric_key="win_rate_global",
+        title="Global Win Rate",
+        subtitle="wins/report_count across all reports.",
+        formatter=_format_pct,
+    )
+    pass_rate_chart = _render_metric_chart_rows(
+        model_summaries=chart_rows,
+        metric_key="mean_pass_rate",
+        title="Historical Mean Pass Rate",
+        subtitle="Average pass-rate share across reports.",
+        formatter=_format_pct,
+    )
+    lines.extend(
+        [
+            '<section class="section">',
+            "<h2>Leaderboard Charts</h2>",
+            '<p class="muted">Visual comparison for the top 12 models by historical mean final score.</p>',
+            '<div class="chart-grid">',
+            score_chart,
+            win_rate_chart,
+            pass_rate_chart,
+            "</div>",
+            "</section>",
+        ]
+    )
+
+    lines.extend(
+        [
+            '<section class="section">',
+        "<h2>Winner Model Means</h2>",
+        '<p class="muted">`mean_per_report = winner_total_score/report_count` across all reports.</p>',
+        '<p class="muted">Click any column header to sort ascending/descending.</p>',
+        ]
+    )
+
+    if winner_rows:
+        lines.extend(
+            [
+                '<div class="table-wrap">',
+                '<table class="sortable" data-default-sort-column="4" data-default-sort-order="desc">',
+                "<thead><tr>"
+                '<th class="col-rank" data-sort-type="number">Rank</th><th class="sticky-col col-model" data-sort-type="text">Winner Model</th><th data-sort-type="number">Wins</th><th data-sort-type="number">Total Winner Score</th>'
+                '<th data-sort-type="number">Mean Per Report (total/report_count)</th><th data-sort-type="number">Mean When Winner (total/wins)</th>'
+                "</tr></thead>",
+                "<tbody>",
+            ]
+        )
+        for rank, row in enumerate(winner_rows, start=1):
+            wins = int(row.get("wins", 0))
+            total_score = _as_float(row.get("total_score"))
+            mean_per_report = _as_float(row.get("mean_per_report"))
+            mean_when_winner = _as_float(row.get("mean_when_winner"))
+            lines.append(
+                "<tr>"
+                f'<td class="col-rank" data-sort-value="{rank}">{rank}</td>'
+                f'<td class="mono sticky-col col-model">{html.escape(str(row.get("model_name", "-")))}</td>'
+                f'<td data-sort-value="{wins}">{wins}</td>'
+                f'<td data-sort-value="{_sort_value(total_score)}">{_format_num(total_score)}</td>'
+                f'<td data-sort-value="{_sort_value(mean_per_report)}">{_format_num(mean_per_report)}</td>'
+                f'<td data-sort-value="{_sort_value(mean_when_winner)}">{_format_num(mean_when_winner)}</td>'
+                "</tr>"
+            )
+        lines.extend(["</tbody>", "</table>", "</div>"])
+    else:
+        lines.append('<p class="muted">No completed report data found.</p>')
+    lines.append("</section>")
+
+    lines.extend(
+        [
+            '<section class="section">',
+            "<h2>Day-by-Day Runs</h2>",
+            '<p class="muted">Each run links to its detailed `leaderboard.html`.</p>',
+            '<p class="muted">Click any column header to sort ascending/descending.</p>',
+        ]
+    )
+
+    if not day_rows:
+        lines.append('<p class="muted">No run directories found under this reports root.</p>')
+    else:
+        for day_key, rows in day_rows:
+            day_total = sum((_as_float(item.get("winner_score")) or 0.0) for item in rows)
+            day_mean = (day_total / len(rows)) if rows else None
+            lines.extend(
+                [
+                    '<div class="day-block">',
+                    f'<h3 class="day-title">{html.escape(day_key)} '
+                    f'<span class="muted">({len(rows)} runs, mean winner={_format_num(day_mean)})</span></h3>',
+                    '<div class="table-wrap">',
+                    '<table class="sortable" data-default-sort-column="1" data-default-sort-order="desc">',
+                    "<thead><tr>"
+                    '<th class="sticky-col col-model" data-sort-type="text">Run</th><th data-sort-type="date">Started</th><th data-sort-type="date">Finished</th><th data-sort-type="text">Winner</th><th data-sort-type="number">Winner Score</th>'
+                    '<th data-sort-type="number">Models</th><th data-sort-type="number">Cases</th><th data-sort-type="number">Warnings</th><th data-sort-type="text">Open</th>'
+                    "</tr></thead>",
+                    "<tbody>",
+                ]
+            )
+            for entry in rows:
+                run_dir_name = str(entry.get("run_dir_name", "-"))
+                run_id = str(entry.get("run_id", "-"))
+                started_at = str(entry.get("started_at", "-"))
+                finished_at = str(entry.get("finished_at", "-"))
+                winner_model = str(entry.get("winner_model", "-"))
+                winner_score = _format_num(_as_float(entry.get("winner_score")))
+                model_count = int(entry.get("model_count") or 0)
+                case_count = int(entry.get("case_count") or 0)
+                warning_count = int(entry.get("warning_count") or 0)
+                link = f"{html.escape(run_dir_name)}/leaderboard.html"
+                lines.append(
+                    "<tr>"
+                    f'<td class="mono sticky-col col-model">{html.escape(run_id)}</td>'
+                    f'<td class="mono" data-sort-value="{html.escape(started_at)}">{html.escape(started_at)}</td>'
+                    f'<td class="mono" data-sort-value="{html.escape(finished_at)}">{html.escape(finished_at)}</td>'
+                    f'<td class="mono">{html.escape(winner_model)}</td>'
+                    f'<td data-sort-value="{_sort_value(_as_float(entry.get("winner_score")))}">{winner_score}</td>'
+                    f'<td data-sort-value="{model_count}">{model_count}</td>'
+                    f'<td data-sort-value="{case_count}">{case_count}</td>'
+                    f'<td data-sort-value="{warning_count}">{warning_count}</td>'
+                    f'<td><a href="{link}">Open</a></td>'
+                    "</tr>"
+                )
+            lines.extend(["</tbody>", "</table>", "</div>", "</div>"])
+    lines.extend(
+        [
+            "</section>",
+        ]
+    )
+    lines.extend(_render_sortable_tables_script_lines())
+    lines.extend(["</main>", "</body>", "</html>"])
+    return "\n".join(lines)
 
 
 def render_leaderboard_markdown(results: dict[str, Any]) -> str:
@@ -238,6 +863,11 @@ def render_leaderboard_html(results: dict[str, Any]) -> str:
         "table { width: 100%; border-collapse: collapse; font-size: 0.93rem; }",
         "th, td { text-align: left; border-bottom: 1px solid #e5e7eb; padding: 10px 8px; vertical-align: top; }",
         "th { background: #f8fafc; color: #111827; }",
+        ".sortable th { user-select: none; }",
+        ".sortable th.sortable-header { cursor: pointer; position: relative; padding-right: 18px; }",
+        ".sortable th.sortable-header::after { content: '↕'; position: absolute; right: 6px; color: #94a3b8; font-size: 0.8rem; }",
+        ".sortable th.sorted-asc::after { content: '↑'; color: #2563eb; }",
+        ".sortable th.sorted-desc::after { content: '↓'; color: #2563eb; }",
         ".mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }",
         ".pie-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }",
         ".pie-card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 10px; background: #fbfdff; }",
@@ -285,29 +915,42 @@ def render_leaderboard_html(results: dict[str, Any]) -> str:
     else:
         lines.extend(
             [
-                "<table>",
+                '<p class="muted">Click any column header to sort ascending/descending.</p>',
+                '<table class="sortable" data-default-sort-column="2" data-default-sort-order="desc">',
                 "<thead><tr>"
-                "<th>Rank</th><th>Model</th><th>Final</th><th>Deterministic</th><th>Judge</th>"
-                "<th>Pass Rate</th><th>TTFT p50/p95</th><th>Latency p50/p95</th>"
-                "<th>Tokens/s p50/p95</th><th>Errors</th>"
+                '<th class="col-rank" data-sort-type="number">Rank</th><th data-sort-type="text">Model</th>'
+                '<th data-sort-type="number">Final</th><th data-sort-type="number">Deterministic</th><th data-sort-type="number">Judge</th>'
+                '<th data-sort-type="percent">Pass Rate</th><th data-sort-type="number">TTFT p50/p95</th><th data-sort-type="number">Latency p50/p95</th>'
+                '<th data-sort-type="number">Tokens/s p50/p95</th><th data-sort-type="number">Errors</th>'
                 "</tr></thead>",
                 "<tbody>",
             ]
         )
 
         for rank, summary in enumerate(model_summaries, start=1):
+            final_score = _as_float(summary.get("final_score_avg"))
+            deterministic_score = _as_float(summary.get("deterministic_score_avg"))
+            judge_score = _as_float(summary.get("judge_score_avg"))
+            pass_rate = _as_float(summary.get("pass_rate"))
+            ttft_p50 = _as_float(summary.get("ttft_p50_s"))
+            ttft_p95 = _as_float(summary.get("ttft_p95_s"))
+            latency_p50 = _as_float(summary.get("latency_p50_s"))
+            latency_p95 = _as_float(summary.get("latency_p95_s"))
+            tokens_per_s_p50 = _as_float(summary.get("tokens_per_s_p50"))
+            tokens_per_s_p95 = _as_float(summary.get("tokens_per_s_p95"))
+            error_count = int(_as_float(summary.get("error_count")) or 0)
             lines.append(
                 "<tr>"
-                f"<td>{rank}</td>"
+                f'<td class="col-rank" data-sort-value="{rank}">{rank}</td>'
                 f'<td class="mono">{html.escape(str(summary.get("model_name", "-")))}</td>'
-                f"<td>{_format_num(_as_float(summary.get('final_score_avg')))}</td>"
-                f"<td>{_format_num(_as_float(summary.get('deterministic_score_avg')))}</td>"
-                f"<td>{_format_num(_as_float(summary.get('judge_score_avg')))}</td>"
-                f"<td>{_format_pct(_as_float(summary.get('pass_rate')))}</td>"
-                f"<td>{_format_num(_as_float(summary.get('ttft_p50_s')))}/{_format_num(_as_float(summary.get('ttft_p95_s')))}</td>"
-                f"<td>{_format_num(_as_float(summary.get('latency_p50_s')))}/{_format_num(_as_float(summary.get('latency_p95_s')))}</td>"
-                f"<td>{_format_num(_as_float(summary.get('tokens_per_s_p50')))}/{_format_num(_as_float(summary.get('tokens_per_s_p95')))}</td>"
-                f"<td>{int(_as_float(summary.get('error_count')) or 0)}</td>"
+                f'<td data-sort-value="{_sort_value(final_score)}">{_format_num(final_score)}</td>'
+                f'<td data-sort-value="{_sort_value(deterministic_score)}">{_format_num(deterministic_score)}</td>'
+                f'<td data-sort-value="{_sort_value(judge_score)}">{_format_num(judge_score)}</td>'
+                f'<td data-sort-value="{_sort_value(pass_rate)}">{_format_pct(pass_rate)}</td>'
+                f'<td data-sort-value="{_sort_value(ttft_p50)}">{_format_num(ttft_p50)}/{_format_num(ttft_p95)}</td>'
+                f'<td data-sort-value="{_sort_value(latency_p50)}">{_format_num(latency_p50)}/{_format_num(latency_p95)}</td>'
+                f'<td data-sort-value="{_sort_value(tokens_per_s_p50)}">{_format_num(tokens_per_s_p50)}/{_format_num(tokens_per_s_p95)}</td>'
+                f'<td data-sort-value="{error_count}">{error_count}</td>'
                 "</tr>"
             )
 
@@ -421,6 +1064,7 @@ def render_leaderboard_html(results: dict[str, Any]) -> str:
             lines.append(f"<li>{html.escape(warning)}</li>")
         lines.extend(["</ul>", "</section>"])
 
+    lines.extend(_render_sortable_tables_script_lines())
     lines.extend(["</main>", "</body>", "</html>"])
     return "\n".join(lines)
 
@@ -438,6 +1082,13 @@ def write_html_report(results: dict[str, Any], output_path: Path) -> None:
 def write_reports(results: dict[str, Any], markdown_output_path: Path, html_output_path: Path) -> None:
     write_markdown_report(results, markdown_output_path)
     write_html_report(results, html_output_path)
+
+
+def write_history_report(reports_root: Path, output_path: Path | None = None) -> Path:
+    target = output_path or (reports_root / "history.html")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(render_history_html(reports_root), encoding="utf-8")
+    return target
 
 
 def regenerate_reports_from_json(

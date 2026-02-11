@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .config import load_config, parse_csv_arg
 from .providers import resolve_candidate_models
-from .report import regenerate_reports_from_json
+from .report import regenerate_reports_from_json, write_history_report
 from .runner import RunOptions, persist_run_results, run_benchmark
 
 
@@ -46,6 +46,10 @@ def _build_parser() -> argparse.ArgumentParser:
     report_parser.add_argument("--input", type=Path, required=True, help="Path to results.json")
     report_parser.add_argument("--output", type=Path, help="Optional markdown output path")
     report_parser.add_argument("--html-output", type=Path, help="Optional HTML output path")
+
+    history_parser = subparsers.add_parser("history", help="Generate day-by-day reports dashboard HTML")
+    history_parser.add_argument("--reports-dir", type=Path, help="Reports root directory (default: EVAL_OUTPUT_DIR)")
+    history_parser.add_argument("--output", type=Path, help="Optional output path (default: <reports-dir>/history.html)")
 
     return parser
 
@@ -144,6 +148,14 @@ def _report_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _history_command(args: argparse.Namespace) -> int:
+    config = load_config()
+    reports_root = args.reports_dir or config.output_dir
+    history_output = write_history_report(reports_root, args.output)
+    print(f"Wrote history dashboard: {history_output}")
+    return 0
+
+
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
@@ -155,6 +167,8 @@ def main() -> int:
             return _list_models_command(args)
         if args.command == "report":
             return _report_command(args)
+        if args.command == "history":
+            return _history_command(args)
     except Exception as exc:  # noqa: BLE001
         print(f"Error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2

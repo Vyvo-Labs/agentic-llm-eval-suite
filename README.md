@@ -17,6 +17,7 @@ scores from deterministic checks plus optional LLM-judge rubric scoring.
   - `leaderboard.md`
   - `leaderboard.html`
   - `raw_responses.jsonl`
+  - `reports/history.html` (day-by-day dashboard across runs with historical leaderboard + winner metrics)
 
 ## Install
 
@@ -38,6 +39,9 @@ uv run eval-suite list-models
 
 # Rebuild markdown + HTML reports from prior run
 uv run eval-suite report --input reports/<run_id>/results.json
+
+# Rebuild day-by-day dashboard across reports/
+uv run eval-suite history
 
 # Optional custom output paths
 uv run eval-suite report --input reports/<run_id>/results.json --output reports/custom.md --html-output reports/custom.html

@@ -25,12 +25,16 @@ def test_persist_run_results_writes_html_and_markdown_reports(tmp_path: Path) ->
     html_path = run_dir / "leaderboard.html"
     results_path = run_dir / "results.json"
     raw_path = run_dir / "raw_responses.jsonl"
+    history_path = tmp_path / "history.html"
 
     assert results_path.exists()
     assert markdown_path.exists()
     assert html_path.exists()
     assert raw_path.exists()
+    assert history_path.exists()
     assert "LLM Eval Leaderboard" in markdown_path.read_text(encoding="utf-8")
     html_content = html_path.read_text(encoding="utf-8")
     assert "<!doctype html>" in html_content
     assert "<h2>Leaderboard</h2>" in html_content
+    history_content = history_path.read_text(encoding="utf-8")
+    assert "LLM Eval Reports History" in history_content
