@@ -83,6 +83,8 @@ def test_render_leaderboard_markdown_detailed_sections() -> None:
     assert "LLM Eval Leaderboard (r1)" in markdown
     assert markdown.index("openai/gpt-5-mini") < markdown.index("openrouter/qwen")
     assert "## Notable Failed Cases" in markdown
+    assert "`case-mid` on `openrouter/qwen`" in markdown
+    assert "## Execution Errors" in markdown
     assert "`case-low` on `openrouter/qwen`" in markdown
     assert "error=TimeoutError" in markdown
     assert "## Warnings" in markdown
@@ -104,6 +106,7 @@ def test_render_leaderboard_html_includes_leaderboard_pies_charts_and_explanatio
     assert "Latency Chart (p50 seconds)" in html_output
     assert "<h2>Explanation</h2>" in html_output
     assert "Notable Failed Cases" in html_output
+    assert "Execution Errors" in html_output
     assert "case-low" in html_output
     assert "TimeoutError" in html_output
     assert "Judge endpoint unavailable for one provider" in html_output
@@ -200,6 +203,7 @@ def test_write_history_report_groups_runs_day_by_day_and_computes_winner_mean(tm
     assert output_path == reports_root / "history.html"
     assert "LLM Eval Reports History" in html_text
     assert "Historical Leaderboard" in html_text
+    assert "Provider Cross-Compare" in html_text
     assert "Leaderboard Charts" in html_text
     assert "Historical Mean Final Score" in html_text
     assert "Global Win Rate" in html_text
@@ -207,11 +211,13 @@ def test_write_history_report_groups_runs_day_by_day_and_computes_winner_mean(tm
     assert "Click any column header to sort ascending/descending." in html_text
     assert "updateRankColumn" in html_text
     assert "Mean Final" in html_text
+    assert "Mean Best Final/Report" in html_text
     assert "Mean Pass Rate" in html_text
     assert "Day-by-Day Runs" in html_text
     assert "2026-02-10" in html_text
     assert "2026-02-11" in html_text
     assert "Mean Winner Score" in html_text
+    assert "Distinct Providers" in html_text
     assert "66.7%" in html_text
     assert "0.897" in html_text
     assert "total=2.700 / reports=3" in html_text
@@ -224,7 +230,9 @@ def test_render_history_html_handles_missing_reports_root(tmp_path: Path) -> Non
     missing_root = tmp_path / "missing"
     html_text = render_history_html(missing_root)
     assert "Historical Leaderboard" in html_text
+    assert "Provider Cross-Compare" in html_text
     assert "Leaderboard Charts" in html_text
     assert "No chart data available." in html_text
     assert "No completed report data found." in html_text
+    assert "No provider comparison data found." in html_text
     assert "No run directories found under this reports root." in html_text

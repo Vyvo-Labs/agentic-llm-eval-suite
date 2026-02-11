@@ -525,6 +525,53 @@ def test_call_model_once_retries_when_non_stream_response_is_empty(
     assert len(fake_completions.calls) >= 3
 
 
+def test_call_model_once_retries_transient_rate_limit_error(
+    monkeypatch: object,
+) -> None:
+    class _FakeCompletions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+            self.non_stream_calls = 0
+
+        def create(self, **kwargs: object) -> object:
+            self.calls.append(dict(kwargs))
+            if kwargs.get("stream"):
+                raise RuntimeError("stream unsupported")
+
+            self.non_stream_calls += 1
+            if self.non_stream_calls == 1:
+                raise RuntimeError(
+                    "RateLimitError: Error code: 429 - temporarily rate-limited upstream"
+                )
+
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="retry success"))],
+                usage={"completion_tokens": 6},
+            )
+
+    fake_completions = _FakeCompletions()
+
+    class _FakeOpenAI:
+        def __init__(self, **_: object) -> None:
+            self.chat = SimpleNamespace(completions=fake_completions)
+
+    monkeypatch.setattr(runner_mod, "OpenAI", _FakeOpenAI)
+    monkeypatch.setattr(runner_mod.time, "sleep", lambda *_: None)
+
+    result = _call_model_once(
+        endpoint=_endpoint(),
+        messages=[{"role": "user", "content": "hello"}],
+        timeout_s=5.0,
+        max_completion_tokens=32,
+        reasoning_effort=None,
+        temperature=None,
+    )
+
+    assert result.output_text == "retry success"
+    assert result.usage.llm_completion_tokens == 6
+    assert fake_completions.non_stream_calls == 2
+
+
 def test_build_request_attempts_includes_boosted_max_tokens_fallback() -> None:
     attempts = _build_request_attempts(
         {

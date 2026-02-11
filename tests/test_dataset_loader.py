@@ -30,6 +30,12 @@ NEW_CASE_IDS = {
     "st_contract_tool_call_file_lookup",
     "st_reasoning_date_math_json",
     "st_reasoning_compare_table_json",
+    "st_reasoning_modular_arithmetic_json",
+    "st_reasoning_weighted_average_sla_json",
+    "st_reasoning_business_days_deadline_json",
+    "st_transform_set_operations_json",
+    "st_format_minified_json_exact",
+    "st_reasoning_currency_split_json",
     "mt_preference_update_latest_wins",
     "mt_name_correction_persistence",
     "mt_timezone_memory",
@@ -58,6 +64,10 @@ NEW_CASE_IDS = {
     "mt_safety_boundary_persistence",
     "mt_context_switch_return",
     "mt_error_acknowledge_and_recover",
+    "mt_budget_percentage_update_json",
+    "mt_context_table_recall_math_json",
+    "mt_latest_override_tool_payload",
+    "mt_timezone_reschedule_chain_json",
 }
 
 CHAT_INTELLIGENCE_CASE_IDS = {
@@ -121,7 +131,7 @@ cases:
 
 def test_project_datasets_have_expanded_case_count() -> None:
     cases = load_cases(PROJECT_DATASETS)
-    assert len(cases) >= 57
+    assert len(cases) >= 67
 
 
 def test_new_cases_exist_and_have_minimum_deterministic_signal() -> None:
@@ -148,9 +158,9 @@ def test_new_cases_have_balanced_judge_coverage() -> None:
     cases = load_cases(PROJECT_DATASETS)
     selected = [case for case in cases if case.id in NEW_CASE_IDS]
 
-    assert len(selected) == 52
+    assert len(selected) == 62
     force_count = sum(1 for case in selected if case.judge_rubric.force)
-    assert force_count >= 30
+    assert force_count >= 40
 
     deterministic_heavy = sum(
         1 for case in selected if case.weights.deterministic > case.weights.judge
@@ -158,9 +168,9 @@ def test_new_cases_have_balanced_judge_coverage() -> None:
     judge_heavy = sum(1 for case in selected if case.weights.judge > case.weights.deterministic)
     balanced_or_judge = len(selected) - deterministic_heavy
 
-    assert deterministic_heavy >= 25
-    assert judge_heavy >= 18
-    assert balanced_or_judge >= 20
+    assert deterministic_heavy >= 32
+    assert judge_heavy >= 20
+    assert balanced_or_judge >= 24
 
 
 def test_chat_intelligence_cases_are_multi_turn_and_judge_heavy() -> None:

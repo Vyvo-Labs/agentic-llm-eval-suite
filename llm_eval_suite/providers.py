@@ -57,6 +57,8 @@ _DEFAULT_PRESET_MODELS: dict[str, list[str]] = {
         "z-ai/glm-4.7-flash",
         "minimax/minimax-m2-her",
         "stepfun/step-3.5-flash",
+        "xiaomi/mimo-v2-flash",
+        "nvidia/nemotron-3-nano-30b-a3b",
         "meituan/longcat-flash-chat",
     ],
     "fireworks": ["accounts/fireworks/models/llama-v3p1-8b-instruct"],

@@ -58,6 +58,19 @@ def _sort_value(value: float | None) -> str:
     return f"{value:.12f}"
 
 
+def _infer_provider_label(summary: dict[str, Any]) -> str:
+    provider = str(summary.get("provider", "")).strip().lower()
+    if provider:
+        return provider
+
+    model_name = str(summary.get("model_name", "")).strip().lower()
+    if "/" in model_name:
+        prefix = model_name.split("/", 1)[0].strip()
+        if prefix:
+            return prefix
+    return "unknown"
+
+
 def _sorted_model_summaries(results: dict[str, Any]) -> list[dict[str, Any]]:
     model_summaries = list(results.get("model_summaries", []))
     model_summaries.sort(
@@ -75,6 +88,31 @@ def _sorted_failed_cases(results: dict[str, Any]) -> list[dict[str, Any]]:
     ]
     failed_cases.sort(key=lambda item: _as_float(item.get("final_score")) or 0.0)
     return failed_cases
+
+
+def _case_error_text(case: dict[str, Any]) -> str | None:
+    inference = case.get("inference", {})
+    if not isinstance(inference, dict):
+        return None
+    raw = inference.get("error")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    return text or None
+
+
+def _split_failed_cases(results: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    failed_cases = _sorted_failed_cases(results)
+    quality_failures: list[dict[str, Any]] = []
+    execution_errors: list[dict[str, Any]] = []
+
+    for case in failed_cases:
+        if _case_error_text(case):
+            execution_errors.append(case)
+        else:
+            quality_failures.append(case)
+
+    return quality_failures, execution_errors
 
 
 def _derive_day_key(*, started_at: str, run_dir_name: str) -> str:
@@ -113,6 +151,7 @@ def _load_history_entries(reports_root: Path) -> list[dict[str, Any]]:
             normalized_summaries.append(
                 {
                     "model_name": model_name,
+                    "provider": _infer_provider_label(summary),
                     "final_score_avg": _as_float(summary.get("final_score_avg")),
                     "pass_rate": _as_float(summary.get("pass_rate")),
                     "deterministic_score_avg": _as_float(summary.get("deterministic_score_avg")),
@@ -280,6 +319,126 @@ def _build_history_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
         reverse=True,
     )
 
+    historical_by_provider: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        model_summaries = list(entry.get("model_summaries", []))
+        provider_rows_in_run: dict[str, list[dict[str, Any]]] = {}
+
+        winner_model = str(entry.get("winner_model", "-"))
+        winner_provider = ""
+
+        for summary in model_summaries:
+            model_name = str(summary.get("model_name", "-"))
+            provider = _infer_provider_label(summary)
+            if model_name == winner_model and not winner_provider:
+                winner_provider = provider
+
+            provider_rows_in_run.setdefault(provider, []).append(summary)
+
+            state = historical_by_provider.setdefault(
+                provider,
+                {
+                    "provider": provider,
+                    "reports_seen": 0,
+                    "model_rows": 0,
+                    "wins": 0,
+                    "final_scores": [],
+                    "pass_rates": [],
+                    "deterministic_scores": [],
+                    "judge_scores": [],
+                    "latency_p50_values": [],
+                    "ttft_p50_values": [],
+                    "tokens_per_s_p50_values": [],
+                    "best_final_per_report_values": [],
+                    "error_total": 0,
+                },
+            )
+            state["model_rows"] += 1
+
+            final_score = _as_float(summary.get("final_score_avg"))
+            pass_rate = _as_float(summary.get("pass_rate"))
+            deterministic_score = _as_float(summary.get("deterministic_score_avg"))
+            judge_score = _as_float(summary.get("judge_score_avg"))
+            latency_p50 = _as_float(summary.get("latency_p50_s"))
+            ttft_p50 = _as_float(summary.get("ttft_p50_s"))
+            tokens_per_s_p50 = _as_float(summary.get("tokens_per_s_p50"))
+            error_count = _as_float(summary.get("error_count"))
+
+            if final_score is not None:
+                state["final_scores"].append(final_score)
+            if pass_rate is not None:
+                state["pass_rates"].append(pass_rate)
+            if deterministic_score is not None:
+                state["deterministic_scores"].append(deterministic_score)
+            if judge_score is not None:
+                state["judge_scores"].append(judge_score)
+            if latency_p50 is not None:
+                state["latency_p50_values"].append(latency_p50)
+            if ttft_p50 is not None:
+                state["ttft_p50_values"].append(ttft_p50)
+            if tokens_per_s_p50 is not None:
+                state["tokens_per_s_p50_values"].append(tokens_per_s_p50)
+            if error_count is not None:
+                state["error_total"] += int(error_count)
+
+        if not winner_provider and "/" in winner_model:
+            winner_provider = winner_model.split("/", 1)[0].strip().lower()
+
+        for provider, rows in provider_rows_in_run.items():
+            state = historical_by_provider[provider]
+            state["reports_seen"] += 1
+
+            best_final_candidates = [
+                value
+                for value in (_as_float(item.get("final_score_avg")) for item in rows)
+                if value is not None
+            ]
+            if best_final_candidates:
+                state["best_final_per_report_values"].append(max(best_final_candidates))
+
+        if winner_provider and winner_provider in historical_by_provider:
+            historical_by_provider[winner_provider]["wins"] += 1
+
+    provider_rows: list[dict[str, Any]] = []
+    for state in historical_by_provider.values():
+        reports_seen = int(state["reports_seen"])
+        wins = int(state["wins"])
+        model_rows = int(state["model_rows"])
+        provider_rows.append(
+            {
+                "provider": state["provider"],
+                "reports_seen": reports_seen,
+                "models_seen_total": model_rows,
+                "wins": wins,
+                "win_rate_global": (wins / report_count) if report_count else None,
+                "win_rate_seen": (wins / reports_seen) if reports_seen else None,
+                "mean_final_score": _mean([float(item) for item in state["final_scores"]]),
+                "mean_best_final_per_report": _mean(
+                    [float(item) for item in state["best_final_per_report_values"]]
+                ),
+                "mean_pass_rate": _mean([float(item) for item in state["pass_rates"]]),
+                "mean_deterministic_score": _mean(
+                    [float(item) for item in state["deterministic_scores"]]
+                ),
+                "mean_judge_score": _mean([float(item) for item in state["judge_scores"]]),
+                "mean_latency_p50_s": _mean([float(item) for item in state["latency_p50_values"]]),
+                "mean_ttft_p50_s": _mean([float(item) for item in state["ttft_p50_values"]]),
+                "mean_tokens_per_s_p50": _mean(
+                    [float(item) for item in state["tokens_per_s_p50_values"]]
+                ),
+                "mean_error_count_per_model": ((state["error_total"] / model_rows) if model_rows else None),
+            }
+        )
+    provider_rows.sort(
+        key=lambda item: (
+            _as_float(item.get("mean_best_final_per_report")) or 0.0,
+            _as_float(item.get("mean_final_score")) or 0.0,
+            _as_float(item.get("win_rate_global")) or 0.0,
+            int(item.get("wins") or 0),
+        ),
+        reverse=True,
+    )
+
     grouped_days: dict[str, list[dict[str, Any]]] = {}
     for entry in entries:
         grouped_days.setdefault(str(entry.get("day_key", "unknown")), []).append(entry)
@@ -293,6 +452,8 @@ def _build_history_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
         "winner_model_count": len(winner_rows),
         "winner_rows": winner_rows,
         "historical_leaderboard_rows": historical_leaderboard_rows,
+        "provider_row_count": len(provider_rows),
+        "provider_rows": provider_rows,
         "day_rows": day_rows,
     }
 
@@ -417,6 +578,8 @@ def render_history_html(reports_root: Path) -> str:
     winner_model_count = int(metrics["winner_model_count"])
     winner_rows = list(metrics["winner_rows"])
     historical_leaderboard_rows = list(metrics["historical_leaderboard_rows"])
+    provider_row_count = int(metrics["provider_row_count"])
+    provider_rows = list(metrics["provider_rows"])
     day_rows = list(metrics["day_rows"])
 
     lines: list[str] = [
@@ -480,6 +643,7 @@ def render_history_html(reports_root: Path) -> str:
             f'(total={_format_num(winner_total_score)} / reports={report_count})</div></div>'
         ),
         f'<div class="meta-card"><strong>Distinct Winner Models</strong><div class="mono">{winner_model_count}</div></div>',
+        f'<div class="meta-card"><strong>Distinct Providers</strong><div class="mono">{provider_row_count}</div></div>',
         "</div>",
         "</section>",
         '<section class="section">',
@@ -537,6 +701,69 @@ def render_history_html(reports_root: Path) -> str:
         lines.extend(["</tbody>", "</table>", "</div>"])
     else:
         lines.append('<p class="muted">No completed report data found.</p>')
+    lines.append("</section>")
+
+    lines.extend(
+        [
+            '<section class="section">',
+            "<h2>Provider Cross-Compare</h2>",
+            '<p class="muted">Cross-report comparison aggregated by provider.</p>',
+            '<p class="muted">Click any column header to sort ascending/descending.</p>',
+        ]
+    )
+
+    if provider_rows:
+        lines.extend(
+            [
+                '<div class="table-wrap">',
+                '<table class="sortable" data-default-sort-column="7" data-default-sort-order="desc">',
+                "<thead><tr>"
+                '<th class="col-rank" data-sort-type="number">Rank</th><th class="sticky-col col-model" data-sort-type="text">Provider</th>'
+                '<th data-sort-type="number">Reports</th><th data-sort-type="number">Model Rows</th><th data-sort-type="number">Wins</th><th data-sort-type="percent">Win Rate (wins/report_count)</th>'
+                '<th data-sort-type="number">Mean Final</th><th data-sort-type="number">Mean Best Final/Report</th><th data-sort-type="percent">Mean Pass Rate</th>'
+                '<th data-sort-type="number">Mean Deterministic</th><th data-sort-type="number">Mean Judge</th><th data-sort-type="number">Mean Latency p50</th>'
+                '<th data-sort-type="number">Mean TTFT p50</th><th data-sort-type="number">Mean Tokens/s p50</th><th data-sort-type="number">Mean Errors/Model Row</th>'
+                "</tr></thead>",
+                "<tbody>",
+            ]
+        )
+        for rank, row in enumerate(provider_rows, start=1):
+            reports_seen = int(row.get("reports_seen") or 0)
+            models_seen_total = int(row.get("models_seen_total") or 0)
+            wins = int(row.get("wins") or 0)
+            win_rate_global = _as_float(row.get("win_rate_global"))
+            mean_final_score = _as_float(row.get("mean_final_score"))
+            mean_best_final_per_report = _as_float(row.get("mean_best_final_per_report"))
+            mean_pass_rate = _as_float(row.get("mean_pass_rate"))
+            mean_deterministic_score = _as_float(row.get("mean_deterministic_score"))
+            mean_judge_score = _as_float(row.get("mean_judge_score"))
+            mean_latency_p50_s = _as_float(row.get("mean_latency_p50_s"))
+            mean_ttft_p50_s = _as_float(row.get("mean_ttft_p50_s"))
+            mean_tokens_per_s_p50 = _as_float(row.get("mean_tokens_per_s_p50"))
+            mean_error_count_per_model = _as_float(row.get("mean_error_count_per_model"))
+
+            lines.append(
+                "<tr>"
+                f'<td class="col-rank" data-sort-value="{rank}">{rank}</td>'
+                f'<td class="mono sticky-col col-model">{html.escape(str(row.get("provider", "-")))}</td>'
+                f'<td data-sort-value="{reports_seen}">{reports_seen}</td>'
+                f'<td data-sort-value="{models_seen_total}">{models_seen_total}</td>'
+                f'<td data-sort-value="{wins}">{wins}</td>'
+                f'<td data-sort-value="{_sort_value(win_rate_global)}">{_format_pct(win_rate_global)}</td>'
+                f'<td data-sort-value="{_sort_value(mean_final_score)}">{_format_num(mean_final_score)}</td>'
+                f'<td data-sort-value="{_sort_value(mean_best_final_per_report)}">{_format_num(mean_best_final_per_report)}</td>'
+                f'<td data-sort-value="{_sort_value(mean_pass_rate)}">{_format_pct(mean_pass_rate)}</td>'
+                f'<td data-sort-value="{_sort_value(mean_deterministic_score)}">{_format_num(mean_deterministic_score)}</td>'
+                f'<td data-sort-value="{_sort_value(mean_judge_score)}">{_format_num(mean_judge_score)}</td>'
+                f'<td data-sort-value="{_sort_value(mean_latency_p50_s)}">{_format_num(mean_latency_p50_s)}</td>'
+                f'<td data-sort-value="{_sort_value(mean_ttft_p50_s)}">{_format_num(mean_ttft_p50_s)}</td>'
+                f'<td data-sort-value="{_sort_value(mean_tokens_per_s_p50)}">{_format_num(mean_tokens_per_s_p50)}</td>'
+                f'<td data-sort-value="{_sort_value(mean_error_count_per_model)}">{_format_num(mean_error_count_per_model)}</td>'
+                "</tr>"
+            )
+        lines.extend(["</tbody>", "</table>", "</div>"])
+    else:
+        lines.append('<p class="muted">No provider comparison data found.</p>')
     lines.append("</section>")
 
     chart_rows = historical_leaderboard_rows[:12]
@@ -732,13 +959,13 @@ def render_leaderboard_markdown(results: dict[str, Any]) -> str:
             " |"
         )
 
-    failed_cases = _sorted_failed_cases(results)
+    quality_failures, execution_errors = _split_failed_cases(results)
 
-    if failed_cases:
+    if quality_failures:
         lines.append("")
         lines.append("## Notable Failed Cases")
         lines.append("")
-        for case in failed_cases[:10]:
+        for case in quality_failures[:10]:
             inference = case.get("inference", {})
             error = inference.get("error")
             lines.append(
@@ -746,6 +973,22 @@ def render_leaderboard_markdown(results: dict[str, Any]) -> str:
                 f"`{case.get('case_id')}` on `{case.get('model_name')}`: "
                 f"score={_format_num(case.get('final_score'))}"
                 + (f" error={error}" if error else "")
+            )
+
+    if execution_errors:
+        lines.append("")
+        lines.append("## Execution Errors")
+        lines.append("")
+        lines.append(
+            "_These failures include transport/provider issues (e.g., rate limits or empty responses)._"
+        )
+        lines.append("")
+        for case in execution_errors[:10]:
+            lines.append(
+                "- "
+                f"`{case.get('case_id')}` on `{case.get('model_name')}`: "
+                f"score={_format_num(case.get('final_score'))} "
+                f"error={_case_error_text(case)}"
             )
 
     warnings = results.get("warnings", [])
@@ -833,7 +1076,7 @@ def render_leaderboard_html(results: dict[str, Any]) -> str:
     dataset_text = ", ".join(datasets) if datasets else "-"
 
     model_summaries = _sorted_model_summaries(results)
-    failed_cases = _sorted_failed_cases(results)
+    quality_failures, execution_errors = _split_failed_cases(results)
     warnings = [str(item) for item in results.get("warnings", [])]
 
     top_model = model_summaries[0] if model_summaries else None
@@ -1031,7 +1274,7 @@ def render_leaderboard_html(results: dict[str, Any]) -> str:
         ]
     )
 
-    if failed_cases:
+    if quality_failures:
         lines.extend(
             [
                 '<section class="section">',
@@ -1039,7 +1282,7 @@ def render_leaderboard_html(results: dict[str, Any]) -> str:
                 '<ul class="failed-list">',
             ]
         )
-        for case in failed_cases[:10]:
+        for case in quality_failures[:10]:
             inference = case.get("inference", {})
             error = inference.get("error")
             details = (
@@ -1049,6 +1292,25 @@ def render_leaderboard_html(results: dict[str, Any]) -> str:
             )
             if error:
                 details += f" | error={html.escape(str(error))}"
+            lines.append(f"<li><span class=\"mono\">{details}</span></li>")
+        lines.extend(["</ul>", "</section>"])
+
+    if execution_errors:
+        lines.extend(
+            [
+                '<section class="section">',
+                "<h2>Execution Errors</h2>",
+                '<p class="muted">These failures include transport/provider issues (e.g., rate limits or empty responses).</p>',
+                '<ul class="failed-list">',
+            ]
+        )
+        for case in execution_errors[:10]:
+            details = (
+                f"{html.escape(str(case.get('case_id', '-')))} on "
+                f"{html.escape(str(case.get('model_name', '-')))}: "
+                f"score={html.escape(_format_num(_as_float(case.get('final_score'))))}"
+                f" | error={html.escape(str(_case_error_text(case) or '-'))}"
+            )
             lines.append(f"<li><span class=\"mono\">{details}</span></li>")
         lines.extend(["</ul>", "</section>"])
 

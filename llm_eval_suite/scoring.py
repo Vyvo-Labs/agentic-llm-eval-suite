@@ -6,6 +6,19 @@ from statistics import mean
 
 from .models import DeterministicScore, EvalCase
 
+_UNICODE_PUNCT_TRANSLATION = str.maketrans(
+    {
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2212": "-",
+        "\u00a0": " ",
+    }
+)
+
 
 def _normalize_text(value: str) -> str:
     return " ".join(value.strip().split()).lower()
@@ -13,7 +26,13 @@ def _normalize_text(value: str) -> str:
 
 def _safe_regex_search(pattern: str, text: str) -> bool:
     try:
-        return re.search(pattern, text, re.IGNORECASE | re.MULTILINE) is not None
+        if re.search(pattern, text, re.IGNORECASE | re.MULTILINE) is not None:
+            return True
+
+        normalized_text = text.translate(_UNICODE_PUNCT_TRANSLATION)
+        if normalized_text != text:
+            return re.search(pattern, normalized_text, re.IGNORECASE | re.MULTILINE) is not None
+        return False
     except re.error:
         return False
 

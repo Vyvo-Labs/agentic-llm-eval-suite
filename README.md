@@ -127,6 +127,8 @@ Default OpenRouter preset models:
 - `z-ai/glm-4.7-flash`
 - `minimax/minimax-m2-her`
 - `stepfun/step-3.5-flash`
+- `xiaomi/mimo-v2-flash`
+- `nvidia/nemotron-3-nano-30b-a3b`
 - `meituan/longcat-flash-chat`
 
 ### Runtime

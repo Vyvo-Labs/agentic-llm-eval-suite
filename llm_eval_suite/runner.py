@@ -31,6 +31,21 @@ from .report import write_history_report, write_reports
 from .scoring import combine_scores, evaluate_deterministic
 
 PASS_THRESHOLD = 0.8
+_TRANSIENT_ERROR_HINTS: tuple[str, ...] = (
+    "429",
+    "rate limit",
+    "rate-limited",
+    "temporarily rate-limited",
+    "timeout",
+    "timed out",
+    "connection",
+    "service unavailable",
+    "overloaded",
+    "try again",
+    "retry",
+)
+_REQUEST_RETRY_ATTEMPTS = 3
+_REQUEST_RETRY_BASE_BACKOFF_S = 0.6
 
 
 @dataclass(slots=True)
@@ -249,6 +264,37 @@ def _stream_output_requires_retry(output_text: str) -> bool:
     return False
 
 
+def _is_transient_request_error(exc: Exception) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(hint in text for hint in _TRANSIENT_ERROR_HINTS)
+
+
+def _chat_create_with_retries(
+    *,
+    client: OpenAI,
+    request_payload: dict[str, Any],
+    max_attempts: int = _REQUEST_RETRY_ATTEMPTS,
+) -> Any:
+    attempts = max(1, int(max_attempts))
+    last_error: Exception | None = None
+
+    for attempt_index in range(attempts):
+        try:
+            return client.chat.completions.create(**request_payload)
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc if isinstance(exc, Exception) else RuntimeError(str(exc))
+            is_last_attempt = attempt_index >= (attempts - 1)
+            if is_last_attempt or not _is_transient_request_error(last_error):
+                raise last_error
+
+            sleep_s = min(3.0, _REQUEST_RETRY_BASE_BACKOFF_S * (2**attempt_index))
+            time.sleep(sleep_s)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("request failed without explicit error")
+
+
 def _call_model_once(
     *,
     endpoint: LLMEndpoint,
@@ -283,7 +329,7 @@ def _call_model_once(
     stream_error: str | None = None
     stream = None
     try:
-        stream = client.chat.completions.create(**stream_attempt)
+        stream = _chat_create_with_retries(client=client, request_payload=stream_attempt)
         for chunk in stream:
             now = time.perf_counter()
             if now - start > timeout_s:
@@ -343,7 +389,7 @@ def _call_model_once(
     for attempt in attempts:
         try:
             started = time.perf_counter()
-            response = client.chat.completions.create(**attempt)
+            response = _chat_create_with_retries(client=client, request_payload=attempt)
             total_latency_s = time.perf_counter() - started
 
             message = response.choices[0].message
