@@ -111,8 +111,8 @@ Default OpenAI preset models:
 - `gpt-5-mini`
 - `gpt-5`
 - `gpt-5.2`
-- `openai-5-mini-minimal`
-- `openai-5.2-none`
+- `gpt-5-mini/minimal`
+- `gpt-5.2/none`
 
 Default OpenRouter preset models:
 - `moonshotai/kimi-k2.5`
@@ -120,12 +120,10 @@ Default OpenRouter preset models:
 - `z-ai/glm-4.7`
 - `anthropic/claude-haiku-4.5`
 - `anthropic/claude-sonnet-4.5`
-- `anthropic/claude-opus-4.1`
 - `anthropic/claude-opus-4.5`
-- `openai/gpt-5-mini`
-- `openai/gpt-5`
+- `openai/gpt-5-mini/minimal`
 - `openai/gpt-5.2`
-- `openai/gpt-5.2-none`
+- `openai/gpt-5.2/none`
 - `openai/gpt-4.1`
 - `openai/gpt-4.1-mini`
 - `z-ai/glm-4.7-flash`
@@ -144,7 +142,12 @@ Default OpenRouter preset models:
 - `EVAL_REASONING_EFFORT`
 - `EVAL_TEMPERATURE`
 - For `gpt-5.2`, set `EVAL_REASONING_EFFORT=none` for minimal-reasoning runs.
-- `openai-5.2-none` and `openai/gpt-5.2-none` are aliases for `gpt-5.2` with `reasoning_effort=none`.
+- You can encode reasoning effort in model names with a suffix tag:
+  - `gpt-5-mini/minimal`
+  - `openai/gpt-5.2/none`
+- Legacy aliases still work:
+  - `openai-5.2-none` and `openai/gpt-5.2-none` -> `reasoning_effort=none`
+  - `openai-5-mini-minimal` and `openai/gpt-5-mini-minimal` -> `reasoning_effort=minimal`
 - `EVAL_CACHE_ENABLED` (`true` by default)
 - `EVAL_CACHE_DIR` (default: `.cache/llm_eval_suite`)
 - `EVAL_OUTPUT_DIR` (default: `reports`)

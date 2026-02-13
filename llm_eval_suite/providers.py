@@ -30,13 +30,22 @@ _MODEL_ALIAS_TO_BASE: dict[str, str] = {
     "openai-5-mini-minimal": "gpt-5-mini",
 }
 
+_REASONING_EFFORT_TAGS: set[str] = {
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+}
+
 _DEFAULT_PRESET_MODELS: dict[str, list[str]] = {
     "openai": [
         "gpt-5-mini",
         "gpt-5",
         "gpt-5.2",
-        "openai-5-mini-minimal",
-        "openai-5.2-none",
+        "gpt-5-mini/minimal",
+        "gpt-5.2/none",
     ],
     "groq": ["llama-3.3-70b-versatile", "mixtral-8x7b-32768"],
     # OpenRouter defaults bias toward current open models.
@@ -46,12 +55,10 @@ _DEFAULT_PRESET_MODELS: dict[str, list[str]] = {
         "z-ai/glm-4.7",
         "anthropic/claude-haiku-4.5",
         "anthropic/claude-sonnet-4.5",
-        "anthropic/claude-opus-4.1",
         "anthropic/claude-opus-4.5",
-        "openai/gpt-5-mini",
-        "openai/gpt-5",
+        "openai/gpt-5-mini/minimal",
         "openai/gpt-5.2",
-        "openai/gpt-5.2-none",
+        "openai/gpt-5.2/none",
         "openai/gpt-4.1",
         "openai/gpt-4.1-mini",
         "z-ai/glm-4.7-flash",
@@ -88,6 +95,18 @@ class ResolvedModels:
     warnings: list[str]
 
 
+def split_model_reasoning_tag(model: str) -> tuple[str, str | None]:
+    normalized_model = (model or "").strip()
+    if not normalized_model or "/" not in normalized_model:
+        return normalized_model, None
+
+    base_model, possible_tag = normalized_model.rsplit("/", 1)
+    if possible_tag.lower() in _REASONING_EFFORT_TAGS:
+        return base_model, possible_tag.lower()
+
+    return normalized_model, None
+
+
 def normalize_llm_model_for_provider(provider: str, model: str) -> str:
     normalized_model = (model or "").strip()
     if not normalized_model:
@@ -98,6 +117,8 @@ def normalize_llm_model_for_provider(provider: str, model: str) -> str:
         prefix = f"{normalized_provider}/"
         if normalized_model.lower().startswith(prefix):
             normalized_model = normalized_model[len(prefix) :]
+
+    normalized_model, _ = split_model_reasoning_tag(normalized_model)
 
     lowered_model = normalized_model.lower()
     if "/" in normalized_model:

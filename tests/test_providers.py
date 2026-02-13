@@ -39,6 +39,11 @@ def test_model_normalization_maps_none_alias_to_base_model() -> None:
     assert normalize_llm_model_for_provider("openai", "openai-5.2-none") == "gpt-5.2"
 
 
+def test_model_normalization_supports_reasoning_suffix_tags() -> None:
+    assert normalize_llm_model_for_provider("openrouter", "openai/gpt-5-mini/minimal") == "openai/gpt-5-mini"
+    assert normalize_llm_model_for_provider("openrouter", "openrouter/openai/gpt-5.2/none") == "openai/gpt-5.2"
+
+
 def test_resolve_candidate_models_uses_provider_credentials() -> None:
     resolved = resolve_candidate_models(_config())
     assert not resolved.warnings
@@ -79,12 +84,10 @@ def test_openrouter_defaults_include_expected_models() -> None:
         "z-ai/glm-4.7",
         "anthropic/claude-haiku-4.5",
         "anthropic/claude-sonnet-4.5",
-        "anthropic/claude-opus-4.1",
         "anthropic/claude-opus-4.5",
-        "openai/gpt-5-mini",
-        "openai/gpt-5",
+        "openai/gpt-5-mini/minimal",
         "openai/gpt-5.2",
-        "openai/gpt-5.2-none",
+        "openai/gpt-5.2/none",
         "openai/gpt-4.1",
         "openai/gpt-4.1-mini",
         "z-ai/glm-4.7-flash",
@@ -128,8 +131,8 @@ def test_openai_defaults_include_custom_models() -> None:
         "gpt-5-mini",
         "gpt-5",
         "gpt-5.2",
-        "openai-5-mini-minimal",
-        "openai-5.2-none",
+        "gpt-5-mini/minimal",
+        "gpt-5.2/none",
     ]
     assert [item.request_model for item in resolved.candidates] == [
         "gpt-5-mini",

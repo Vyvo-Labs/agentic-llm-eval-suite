@@ -26,7 +26,13 @@ from .models import (
     RunResults,
     UsageStats,
 )
-from .providers import LLMEndpoint, ResolvedModels, resolve_candidate_models, resolve_judge_endpoint
+from .providers import (
+    LLMEndpoint,
+    ResolvedModels,
+    resolve_candidate_models,
+    resolve_judge_endpoint,
+    split_model_reasoning_tag,
+)
 from .report import write_history_report, write_reports
 from .scoring import combine_scores, evaluate_deterministic
 
@@ -527,9 +533,19 @@ def _resolve_reasoning_effort_for_model(
     endpoint: LLMEndpoint,
     configured_reasoning_effort: str | None,
 ) -> str | None:
+    _, tagged_reasoning_effort = split_model_reasoning_tag(endpoint.configured_model)
+    if tagged_reasoning_effort is not None:
+        return tagged_reasoning_effort
+
     model_tail = endpoint.configured_model.strip().lower().split("/")[-1]
-    if model_tail in {"gpt-5.2-none", "openai-5.2-none", "gpt-5-mini-minimal", "openai-5-mini-minimal"}:
-        return "none"
+    legacy_reasoning_aliases: dict[str, str] = {
+        "gpt-5.2-none": "none",
+        "openai-5.2-none": "none",
+        "gpt-5-mini-minimal": "minimal",
+        "openai-5-mini-minimal": "minimal",
+    }
+    if model_tail in legacy_reasoning_aliases:
+        return legacy_reasoning_aliases[model_tail]
     return configured_reasoning_effort
 
 

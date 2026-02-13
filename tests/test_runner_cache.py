@@ -124,6 +124,38 @@ def test_reasoning_effort_override_for_none_alias_models() -> None:
     assert resolved == "none"
 
 
+def test_reasoning_effort_override_for_minimal_alias_models() -> None:
+    endpoint = LLMEndpoint(
+        provider="openai",
+        configured_model="openai-5-mini-minimal",
+        request_model="gpt-5-mini",
+        base_url=None,
+        api_key_env="OPENAI_API_KEY",
+        api_key="sk-test",
+    )
+    resolved = _resolve_reasoning_effort_for_model(
+        endpoint=endpoint,
+        configured_reasoning_effort="high",
+    )
+    assert resolved == "minimal"
+
+
+def test_reasoning_effort_override_from_reasoning_suffix_tag() -> None:
+    endpoint = LLMEndpoint(
+        provider="openrouter",
+        configured_model="openai/gpt-5-mini/minimal",
+        request_model="openai/gpt-5-mini",
+        base_url="https://openrouter.ai/api/v1",
+        api_key_env="OPENROUTER_API_KEY",
+        api_key="sk-or-v1-a",
+    )
+    resolved = _resolve_reasoning_effort_for_model(
+        endpoint=endpoint,
+        configured_reasoning_effort="high",
+    )
+    assert resolved == "minimal"
+
+
 def test_reasoning_effort_override_keeps_config_for_normal_models() -> None:
     endpoint = LLMEndpoint(
         provider="openrouter",
