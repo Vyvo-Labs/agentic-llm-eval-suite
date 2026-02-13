@@ -279,6 +279,54 @@ def test_write_history_report_groups_runs_day_by_day_and_computes_winner_mean(tm
     assert "20260210T120000Z/leaderboard.html" in html_text
 
 
+def test_write_history_report_splits_tied_winner_credits(tmp_path: Path) -> None:
+    reports_root = tmp_path / "reports"
+    run_a = reports_root / "20260212T010000Z"
+    run_b = reports_root / "20260212T020000Z"
+    run_a.mkdir(parents=True)
+    run_b.mkdir(parents=True)
+
+    payload_a = {
+        "run_id": "20260212T010000Z",
+        "started_at": "2026-02-12T01:00:00Z",
+        "finished_at": "2026-02-12T01:02:00Z",
+        "datasets": [],
+        "model_summaries": [
+            {"model_name": "openrouter/model-b", "final_score_avg": 1.0},
+            {"model_name": "openrouter/model-a", "final_score_avg": 1.0},
+        ],
+        "case_results": [{}, {}],
+        "warnings": [],
+    }
+    payload_b = {
+        "run_id": "20260212T020000Z",
+        "started_at": "2026-02-12T02:00:00Z",
+        "finished_at": "2026-02-12T02:02:00Z",
+        "datasets": [],
+        "model_summaries": [
+            {"model_name": "openrouter/model-a", "final_score_avg": 0.9},
+            {"model_name": "openrouter/model-b", "final_score_avg": 0.8},
+        ],
+        "case_results": [{}, {}],
+        "warnings": [],
+    }
+    (run_a / "results.json").write_text(json.dumps(payload_a), encoding="utf-8")
+    (run_b / "results.json").write_text(json.dumps(payload_b), encoding="utf-8")
+
+    html_text = render_history_html(reports_root)
+
+    assert "Tied Reports" in html_text
+    assert "TIE (2): openrouter/model-b, openrouter/model-a" in html_text
+    assert (
+        '<td class="mono sticky-col col-model">openrouter/model-a</td><td data-sort-value="2">2</td>'
+        '<td data-sort-value="1.500000000000">1.5</td><td data-sort-value="0.750000000000">75.0%</td>'
+    ) in html_text
+    assert (
+        '<td class="mono sticky-col col-model">openrouter/model-b</td><td data-sort-value="2">2</td>'
+        '<td data-sort-value="0.500000000000">0.5</td><td data-sort-value="0.250000000000">25.0%</td>'
+    ) in html_text
+
+
 def test_render_history_html_handles_missing_reports_root(tmp_path: Path) -> None:
     missing_root = tmp_path / "missing"
     html_text = render_history_html(missing_root)

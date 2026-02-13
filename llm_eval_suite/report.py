@@ -61,6 +61,45 @@ def _sort_value(value: float | None) -> str:
     return f"{value:.12f}"
 
 
+def _format_count(value: float | None) -> str:
+    if value is None:
+        return "-"
+
+    rounded = round(value)
+    if abs(value - rounded) < 1e-9:
+        return str(int(rounded))
+
+    text = f"{value:.3f}"
+    text = text.rstrip("0").rstrip(".")
+    return text
+
+
+def _winner_model_names(model_summaries: list[dict[str, Any]]) -> tuple[list[str], float | None]:
+    scored_rows: list[tuple[str, float]] = []
+    for summary in model_summaries:
+        model_name = str(summary.get("model_name", "")).strip()
+        score = _as_float(summary.get("final_score_avg"))
+        if not model_name or score is None:
+            continue
+        scored_rows.append((model_name, score))
+
+    if not scored_rows:
+        return [], None
+
+    top_score = max(score for _, score in scored_rows)
+    eps = 1e-9
+    winners = [model_name for model_name, score in scored_rows if abs(score - top_score) <= eps]
+    return winners, top_score
+
+
+def _winner_label(winner_models: list[str]) -> str:
+    if not winner_models:
+        return "-"
+    if len(winner_models) == 1:
+        return winner_models[0]
+    return f"TIE ({len(winner_models)}): " + ", ".join(winner_models)
+
+
 def _is_page_asset_export_enabled() -> bool:
     raw = (os.getenv("EVAL_EXPORT_PAGE_ASSETS") or "").strip().lower()
     if not raw:
@@ -242,9 +281,11 @@ def _load_history_entries(reports_root: Path) -> list[dict[str, Any]]:
                 }
             )
 
-        winner = normalized_summaries[0] if normalized_summaries else {}
-        winner_model = str(winner.get("model_name", "-")) if winner else "-"
-        winner_score = _as_float(winner.get("final_score_avg")) if winner else None
+        winner_models, winner_score = _winner_model_names(normalized_summaries)
+        winner_model = winner_models[0] if winner_models else "-"
+        winner_share = (1.0 / len(winner_models)) if winner_models else 0.0
+        winner_tie = len(winner_models) > 1
+        winner_label = _winner_label(winner_models)
         started_at = str(payload.get("started_at", ""))
         finished_at = str(payload.get("finished_at", ""))
         run_id = str(payload.get("run_id", "")) or child.name
@@ -258,7 +299,11 @@ def _load_history_entries(reports_root: Path) -> list[dict[str, Any]]:
                 "started_at": started_at,
                 "finished_at": finished_at,
                 "winner_model": winner_model,
+                "winner_models": winner_models,
+                "winner_label": winner_label,
                 "winner_score": winner_score,
+                "winner_share": winner_share,
+                "winner_tie": winner_tie,
                 "case_count": len(payload.get("case_results", [])),
                 "model_count": len(normalized_summaries),
                 "warning_count": len(payload.get("warnings", [])),
@@ -280,41 +325,57 @@ def _build_history_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
     report_count = len(entries)
     winner_total_score = sum((entry.get("winner_score") or 0.0) for entry in entries)
     mean_winner_score = (winner_total_score / report_count) if report_count else None
+    tie_report_count = sum(1 for entry in entries if bool(entry.get("winner_tie")))
 
     winner_by_model: dict[str, dict[str, Any]] = {}
     for entry in entries:
-        model_name = str(entry.get("winner_model", "-"))
+        winner_models = [str(item) for item in entry.get("winner_models", []) if str(item).strip()]
+        winner_share = _as_float(entry.get("winner_share")) or 0.0
         winner_score = _as_float(entry.get("winner_score"))
-        if winner_score is None:
+        if winner_score is None or not winner_models or winner_share <= 0:
             continue
-        state = winner_by_model.setdefault(
-            model_name,
-            {"model_name": model_name, "wins": 0, "total_score": 0.0},
-        )
-        state["wins"] += 1
-        state["total_score"] += winner_score
+        is_outright = len(winner_models) == 1
+        for model_name in winner_models:
+            state = winner_by_model.setdefault(
+                model_name,
+                {"model_name": model_name, "win_credits": 0.0, "outright_wins": 0, "total_score": 0.0},
+            )
+            state["win_credits"] += winner_share
+            if is_outright:
+                state["outright_wins"] += 1
+            state["total_score"] += (winner_score * winner_share)
 
     winner_rows: list[dict[str, Any]] = []
     for row in winner_by_model.values():
-        wins = int(row["wins"])
+        wins = float(row["win_credits"])
+        outright_wins = int(row["outright_wins"])
+        tie_win_credits = max(0.0, wins - float(outright_wins))
         total_score = float(row["total_score"])
         winner_rows.append(
             {
                 "model_name": row["model_name"],
                 "wins": wins,
+                "outright_wins": outright_wins,
+                "tie_win_credits": tie_win_credits,
                 "total_score": total_score,
                 "mean_when_winner": (total_score / wins) if wins else None,
                 "mean_per_report": (total_score / report_count) if report_count else None,
             }
         )
     winner_rows.sort(
-        key=lambda item: (_as_float(item.get("mean_per_report")) or 0.0, int(item.get("wins") or 0)),
+        key=lambda item: (
+            _as_float(item.get("mean_per_report")) or 0.0,
+            _as_float(item.get("wins")) or 0.0,
+            int(item.get("outright_wins") or 0),
+        ),
         reverse=True,
     )
 
     historical_by_model: dict[str, dict[str, Any]] = {}
     for entry in entries:
-        winner_model = str(entry.get("winner_model", "-"))
+        winner_models = {str(item) for item in entry.get("winner_models", []) if str(item).strip()}
+        winner_share = _as_float(entry.get("winner_share")) or 0.0
+        is_outright = len(winner_models) == 1
         model_summaries = entry.get("model_summaries", [])
         for summary in model_summaries:
             model_name = str(summary.get("model_name", "-"))
@@ -323,7 +384,8 @@ def _build_history_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
                 {
                     "model_name": model_name,
                     "reports_seen": 0,
-                    "wins": 0,
+                    "win_credits": 0.0,
+                    "outright_wins": 0,
                     "final_scores": [],
                     "pass_rates": [],
                     "deterministic_scores": [],
@@ -335,8 +397,10 @@ def _build_history_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
                 },
             )
             state["reports_seen"] += 1
-            if model_name == winner_model:
-                state["wins"] += 1
+            if model_name in winner_models and winner_share > 0:
+                state["win_credits"] += winner_share
+                if is_outright:
+                    state["outright_wins"] += 1
 
             final_score = _as_float(summary.get("final_score_avg"))
             pass_rate = _as_float(summary.get("pass_rate"))
@@ -367,7 +431,9 @@ def _build_history_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
     historical_leaderboard_rows: list[dict[str, Any]] = []
     for state in historical_by_model.values():
         reports_seen = int(state["reports_seen"])
-        wins = int(state["wins"])
+        wins = float(state["win_credits"])
+        outright_wins = int(state["outright_wins"])
+        tie_win_credits = max(0.0, wins - float(outright_wins))
         final_scores = [float(item) for item in state["final_scores"]]
         total_final_score = sum(final_scores)
         historical_leaderboard_rows.append(
@@ -375,6 +441,8 @@ def _build_history_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
                 "model_name": state["model_name"],
                 "reports_seen": reports_seen,
                 "wins": wins,
+                "outright_wins": outright_wins,
+                "tie_win_credits": tie_win_credits,
                 "win_rate_global": (wins / report_count) if report_count else None,
                 "win_rate_seen": (wins / reports_seen) if reports_seen else None,
                 "total_final_score": total_final_score,
@@ -393,7 +461,8 @@ def _build_history_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
         key=lambda item: (
             _as_float(item.get("mean_final_score")) or 0.0,
             _as_float(item.get("win_rate_global")) or 0.0,
-            int(item.get("wins") or 0),
+            _as_float(item.get("wins")) or 0.0,
+            int(item.get("outright_wins") or 0),
         ),
         reverse=True,
     )
@@ -403,14 +472,16 @@ def _build_history_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
         model_summaries = list(entry.get("model_summaries", []))
         provider_rows_in_run: dict[str, list[dict[str, Any]]] = {}
 
-        winner_model = str(entry.get("winner_model", "-"))
-        winner_provider = ""
+        winner_models = {str(item) for item in entry.get("winner_models", []) if str(item).strip()}
+        winner_share = _as_float(entry.get("winner_share")) or 0.0
+        is_outright = len(winner_models) == 1
+        winner_provider_credits: dict[str, float] = {}
+        model_provider_map: dict[str, str] = {}
 
         for summary in model_summaries:
             model_name = str(summary.get("model_name", "-"))
             provider = _infer_provider_label(summary)
-            if model_name == winner_model and not winner_provider:
-                winner_provider = provider
+            model_provider_map[model_name] = provider
 
             provider_rows_in_run.setdefault(provider, []).append(summary)
 
@@ -420,7 +491,8 @@ def _build_history_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
                     "provider": provider,
                     "reports_seen": 0,
                     "model_rows": 0,
-                    "wins": 0,
+                    "win_credits": 0.0,
+                    "outright_wins": 0,
                     "final_scores": [],
                     "pass_rates": [],
                     "deterministic_scores": [],
@@ -460,9 +532,6 @@ def _build_history_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
             if error_count is not None:
                 state["error_total"] += int(error_count)
 
-        if not winner_provider and "/" in winner_model:
-            winner_provider = winner_model.split("/", 1)[0].strip().lower()
-
         for provider, rows in provider_rows_in_run.items():
             state = historical_by_provider[provider]
             state["reports_seen"] += 1
@@ -475,13 +544,27 @@ def _build_history_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
             if best_final_candidates:
                 state["best_final_per_report_values"].append(max(best_final_candidates))
 
-        if winner_provider and winner_provider in historical_by_provider:
-            historical_by_provider[winner_provider]["wins"] += 1
+        for winner_model in winner_models:
+            provider = model_provider_map.get(winner_model, "")
+            if not provider and "/" in winner_model:
+                provider = winner_model.split("/", 1)[0].strip().lower()
+            if not provider:
+                continue
+            winner_provider_credits[provider] = winner_provider_credits.get(provider, 0.0) + winner_share
+
+        for provider, credit in winner_provider_credits.items():
+            if provider not in historical_by_provider or credit <= 0:
+                continue
+            historical_by_provider[provider]["win_credits"] += credit
+            if is_outright and abs(credit - 1.0) <= 1e-9:
+                historical_by_provider[provider]["outright_wins"] += 1
 
     provider_rows: list[dict[str, Any]] = []
     for state in historical_by_provider.values():
         reports_seen = int(state["reports_seen"])
-        wins = int(state["wins"])
+        wins = float(state["win_credits"])
+        outright_wins = int(state["outright_wins"])
+        tie_win_credits = max(0.0, wins - float(outright_wins))
         model_rows = int(state["model_rows"])
         provider_rows.append(
             {
@@ -489,6 +572,8 @@ def _build_history_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
                 "reports_seen": reports_seen,
                 "models_seen_total": model_rows,
                 "wins": wins,
+                "outright_wins": outright_wins,
+                "tie_win_credits": tie_win_credits,
                 "win_rate_global": (wins / report_count) if report_count else None,
                 "win_rate_seen": (wins / reports_seen) if reports_seen else None,
                 "mean_final_score": _mean([float(item) for item in state["final_scores"]]),
@@ -513,7 +598,8 @@ def _build_history_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
             _as_float(item.get("mean_best_final_per_report")) or 0.0,
             _as_float(item.get("mean_final_score")) or 0.0,
             _as_float(item.get("win_rate_global")) or 0.0,
-            int(item.get("wins") or 0),
+            _as_float(item.get("wins")) or 0.0,
+            int(item.get("outright_wins") or 0),
         ),
         reverse=True,
     )
@@ -526,6 +612,7 @@ def _build_history_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "report_count": report_count,
         "day_count": len(day_rows),
+        "tie_report_count": tie_report_count,
         "winner_total_score": winner_total_score,
         "mean_winner_score": mean_winner_score,
         "winner_model_count": len(winner_rows),
@@ -652,6 +739,7 @@ def render_history_html(reports_root: Path) -> str:
     metrics = _build_history_metrics(entries)
     report_count = int(metrics["report_count"])
     day_count = int(metrics["day_count"])
+    tie_report_count = int(metrics["tie_report_count"])
     winner_total_score = float(metrics["winner_total_score"])
     mean_winner_score = _as_float(metrics["mean_winner_score"])
     winner_model_count = int(metrics["winner_model_count"])
@@ -712,10 +800,11 @@ def render_history_html(reports_root: Path) -> str:
         '<main class="page">',
         '<section class="hero">',
         "<h1>LLM Eval Reports History</h1>",
-        "<p>Inspect benchmark runs day by day and compare winner trends.</p>",
+        "<p>Inspect benchmark runs day by day and compare top-score trends.</p>",
         '<div class="meta-grid">',
         f'<div class="meta-card"><strong>Report Count</strong><div class="mono">{report_count}</div></div>',
         f'<div class="meta-card"><strong>Day Count</strong><div class="mono">{day_count}</div></div>',
+        f'<div class="meta-card"><strong>Tied Reports</strong><div class="mono">{tie_report_count}</div></div>',
         (
             '<div class="meta-card"><strong>Mean Winner Score</strong>'
             f'<div class="mono">{_format_num(mean_winner_score)} '
@@ -728,6 +817,7 @@ def render_history_html(reports_root: Path) -> str:
         '<section class="section">',
         "<h2>Historical Leaderboard</h2>",
         '<p class="muted">Aggregated model metrics across all reports (not only wins).</p>',
+        '<p class="muted">`Win Credits` split ties evenly across tied top models in each run.</p>',
         '<p class="muted">Click any column header to sort ascending/descending.</p>',
     ]
 
@@ -738,7 +828,7 @@ def render_history_html(reports_root: Path) -> str:
                 '<table class="sortable" data-default-sort-column="5" data-default-sort-order="desc">',
                 "<thead><tr>"
                 '<th class="col-rank" data-sort-type="number">Rank</th><th class="sticky-col col-model" data-sort-type="text">Model</th>'
-                '<th data-sort-type="number">Reports</th><th data-sort-type="number">Wins</th><th data-sort-type="percent">Win Rate (wins/report_count)</th>'
+                '<th data-sort-type="number">Reports</th><th data-sort-type="number">Win Credits</th><th data-sort-type="percent">Global Win Rate (credits/report_count)</th>'
                 '<th data-sort-type="number">Mean Final</th><th data-sort-type="number">Median Final</th><th data-sort-type="percent">Mean Pass Rate</th><th data-sort-type="number">Mean Deterministic</th>'
                 '<th data-sort-type="number">Mean Judge</th><th data-sort-type="number">Mean Latency p50</th><th data-sort-type="number">Mean TTFT p50</th>'
                 '<th data-sort-type="number">Mean Tokens/s p50</th><th data-sort-type="number">Mean Errors/Report</th>'
@@ -748,7 +838,7 @@ def render_history_html(reports_root: Path) -> str:
         )
         for rank, row in enumerate(historical_leaderboard_rows, start=1):
             reports_seen = int(row.get("reports_seen") or 0)
-            wins = int(row.get("wins") or 0)
+            wins = _as_float(row.get("wins"))
             win_rate_global = _as_float(row.get("win_rate_global"))
             mean_final_score = _as_float(row.get("mean_final_score"))
             median_final_score = _as_float(row.get("median_final_score"))
@@ -764,7 +854,7 @@ def render_history_html(reports_root: Path) -> str:
                 f'<td class="col-rank" data-sort-value="{rank}">{rank}</td>'
                 f'<td class="mono sticky-col col-model">{html.escape(str(row.get("model_name", "-")))}</td>'
                 f'<td data-sort-value="{reports_seen}">{reports_seen}</td>'
-                f'<td data-sort-value="{wins}">{wins}</td>'
+                f'<td data-sort-value="{_sort_value(wins)}">{_format_count(wins)}</td>'
                 f'<td data-sort-value="{_sort_value(win_rate_global)}">{_format_pct(win_rate_global)}</td>'
                 f'<td data-sort-value="{_sort_value(mean_final_score)}">{_format_num(mean_final_score)}</td>'
                 f'<td data-sort-value="{_sort_value(median_final_score)}">{_format_num(median_final_score)}</td>'
@@ -787,6 +877,7 @@ def render_history_html(reports_root: Path) -> str:
             '<section class="section">',
             "<h2>Provider Cross-Compare</h2>",
             '<p class="muted">Cross-report comparison aggregated by provider.</p>',
+            '<p class="muted">`Win Credits` split ties evenly across tied top models in each run.</p>',
             '<p class="muted">Click any column header to sort ascending/descending.</p>',
         ]
     )
@@ -798,7 +889,7 @@ def render_history_html(reports_root: Path) -> str:
                 '<table class="sortable" data-default-sort-column="7" data-default-sort-order="desc">',
                 "<thead><tr>"
                 '<th class="col-rank" data-sort-type="number">Rank</th><th class="sticky-col col-model" data-sort-type="text">Provider</th>'
-                '<th data-sort-type="number">Reports</th><th data-sort-type="number">Model Rows</th><th data-sort-type="number">Wins</th><th data-sort-type="percent">Win Rate (wins/report_count)</th>'
+                '<th data-sort-type="number">Reports</th><th data-sort-type="number">Model Rows</th><th data-sort-type="number">Win Credits</th><th data-sort-type="percent">Global Win Rate (credits/report_count)</th>'
                 '<th data-sort-type="number">Mean Final</th><th data-sort-type="number">Mean Best Final/Report</th><th data-sort-type="percent">Mean Pass Rate</th>'
                 '<th data-sort-type="number">Mean Deterministic</th><th data-sort-type="number">Mean Judge</th><th data-sort-type="number">Mean Latency p50</th>'
                 '<th data-sort-type="number">Mean TTFT p50</th><th data-sort-type="number">Mean Tokens/s p50</th><th data-sort-type="number">Mean Errors/Model Row</th>'
@@ -809,7 +900,7 @@ def render_history_html(reports_root: Path) -> str:
         for rank, row in enumerate(provider_rows, start=1):
             reports_seen = int(row.get("reports_seen") or 0)
             models_seen_total = int(row.get("models_seen_total") or 0)
-            wins = int(row.get("wins") or 0)
+            wins = _as_float(row.get("wins"))
             win_rate_global = _as_float(row.get("win_rate_global"))
             mean_final_score = _as_float(row.get("mean_final_score"))
             mean_best_final_per_report = _as_float(row.get("mean_best_final_per_report"))
@@ -827,7 +918,7 @@ def render_history_html(reports_root: Path) -> str:
                 f'<td class="mono sticky-col col-model">{html.escape(str(row.get("provider", "-")))}</td>'
                 f'<td data-sort-value="{reports_seen}">{reports_seen}</td>'
                 f'<td data-sort-value="{models_seen_total}">{models_seen_total}</td>'
-                f'<td data-sort-value="{wins}">{wins}</td>'
+                f'<td data-sort-value="{_sort_value(wins)}">{_format_count(wins)}</td>'
                 f'<td data-sort-value="{_sort_value(win_rate_global)}">{_format_pct(win_rate_global)}</td>'
                 f'<td data-sort-value="{_sort_value(mean_final_score)}">{_format_num(mean_final_score)}</td>'
                 f'<td data-sort-value="{_sort_value(mean_best_final_per_report)}">{_format_num(mean_best_final_per_report)}</td>'
@@ -857,7 +948,7 @@ def render_history_html(reports_root: Path) -> str:
         model_summaries=chart_rows,
         metric_key="win_rate_global",
         title="Global Win Rate",
-        subtitle="wins/report_count across all reports.",
+        subtitle="win_credits/report_count across all reports.",
         formatter=_format_pct,
     )
     pass_rate_chart = _render_metric_chart_rows(
@@ -884,9 +975,10 @@ def render_history_html(reports_root: Path) -> str:
     lines.extend(
         [
             '<section class="section">',
-        "<h2>Winner Model Means</h2>",
-        '<p class="muted">`mean_per_report = winner_total_score/report_count` across all reports.</p>',
-        '<p class="muted">Click any column header to sort ascending/descending.</p>',
+            "<h2>Winner Model Means</h2>",
+            '<p class="muted">`mean_per_report = credited_winner_score_total/report_count` across all reports.</p>',
+            '<p class="muted">`Total Winner Score` and `Win Credits` split ties evenly across tied top models.</p>',
+            '<p class="muted">Click any column header to sort ascending/descending.</p>',
         ]
     )
 
@@ -896,14 +988,14 @@ def render_history_html(reports_root: Path) -> str:
                 '<div class="table-wrap">',
                 '<table class="sortable" data-default-sort-column="4" data-default-sort-order="desc">',
                 "<thead><tr>"
-                '<th class="col-rank" data-sort-type="number">Rank</th><th class="sticky-col col-model" data-sort-type="text">Winner Model</th><th data-sort-type="number">Wins</th><th data-sort-type="number">Total Winner Score</th>'
+                '<th class="col-rank" data-sort-type="number">Rank</th><th class="sticky-col col-model" data-sort-type="text">Winner Model</th><th data-sort-type="number">Win Credits</th><th data-sort-type="number">Total Winner Score</th>'
                 '<th data-sort-type="number">Mean Per Report (total/report_count)</th><th data-sort-type="number">Mean When Winner (total/wins)</th>'
                 "</tr></thead>",
                 "<tbody>",
             ]
         )
         for rank, row in enumerate(winner_rows, start=1):
-            wins = int(row.get("wins", 0))
+            wins = _as_float(row.get("wins"))
             total_score = _as_float(row.get("total_score"))
             mean_per_report = _as_float(row.get("mean_per_report"))
             mean_when_winner = _as_float(row.get("mean_when_winner"))
@@ -911,7 +1003,7 @@ def render_history_html(reports_root: Path) -> str:
                 "<tr>"
                 f'<td class="col-rank" data-sort-value="{rank}">{rank}</td>'
                 f'<td class="mono sticky-col col-model">{html.escape(str(row.get("model_name", "-")))}</td>'
-                f'<td data-sort-value="{wins}">{wins}</td>'
+                f'<td data-sort-value="{_sort_value(wins)}">{_format_count(wins)}</td>'
                 f'<td data-sort-value="{_sort_value(total_score)}">{_format_num(total_score)}</td>'
                 f'<td data-sort-value="{_sort_value(mean_per_report)}">{_format_num(mean_per_report)}</td>'
                 f'<td data-sort-value="{_sort_value(mean_when_winner)}">{_format_num(mean_when_winner)}</td>'
@@ -956,7 +1048,7 @@ def render_history_html(reports_root: Path) -> str:
                 run_id = str(entry.get("run_id", "-"))
                 started_at = str(entry.get("started_at", "-"))
                 finished_at = str(entry.get("finished_at", "-"))
-                winner_model = str(entry.get("winner_model", "-"))
+                winner_model = str(entry.get("winner_label", entry.get("winner_model", "-")))
                 winner_score = _format_num(_as_float(entry.get("winner_score")))
                 model_count = int(entry.get("model_count") or 0)
                 case_count = int(entry.get("case_count") or 0)

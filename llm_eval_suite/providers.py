@@ -55,6 +55,7 @@ _DEFAULT_PRESET_MODELS: dict[str, list[str]] = {
         "openai/gpt-4.1",
         "openai/gpt-4.1-mini",
         "z-ai/glm-4.7-flash",
+        "minimax/minimax-m2.5",
         "minimax/minimax-m2-her",
         "stepfun/step-3.5-flash",
         "xiaomi/mimo-v2-flash",
