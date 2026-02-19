@@ -109,6 +109,10 @@ def test_render_leaderboard_html_includes_leaderboard_pies_charts_and_explanatio
     assert "Final Score Chart" in html_output
     assert "Pass Rate Chart" in html_output
     assert "Latency Chart (p50 seconds)" in html_output
+    assert "<h2>Leaderboard Trend Graphs</h2>" in html_output
+    assert "Mean Quality (Final Score Avg)" in html_output
+    assert "Mean Latency (p50 seconds)" in html_output
+    assert "Mean TPS (tokens/s p50)" in html_output
     assert "<h2>Explanation</h2>" in html_output
     assert "Notable Failed Cases" in html_output
     assert "Execution Errors" in html_output
@@ -194,6 +198,10 @@ def test_render_detailed_report_html_includes_historical_score_context(tmp_path:
     )
 
     assert "<h2>Historical Reliability</h2>" in html_output
+    assert "Leaderboard Trend Graphs" in html_output
+    assert "Mean Quality Trend" in html_output
+    assert "Mean Latency Trend (p50 seconds)" in html_output
+    assert "Mean TPS Trend (tokens/s p50)" in html_output
     assert "Current vs Prior Score Distribution" in html_output
     assert "Recent Prior Runs" in html_output
     assert "Prior Runs Used</strong><div class=\"mono\">2</div>" in html_output
@@ -385,6 +393,10 @@ def test_write_history_report_groups_runs_day_by_day_and_computes_winner_mean(tm
     assert "LLM Eval Reports History" in html_text
     assert "Historical Leaderboard" in html_text
     assert "Provider Cross-Compare" in html_text
+    assert "Leaderboard Trend Graphs" in html_text
+    assert "Mean Quality Trend" in html_text
+    assert "Mean Latency Trend (p50 seconds)" in html_text
+    assert "Mean TPS Trend (tokens/s p50)" in html_text
     assert "Leaderboard Charts" in html_text
     assert "Historical Mean Final Score" in html_text
     assert "Global Win Rate" in html_text
@@ -462,6 +474,7 @@ def test_render_history_html_handles_missing_reports_root(tmp_path: Path) -> Non
     html_text = render_history_html(missing_root)
     assert "Historical Leaderboard" in html_text
     assert "Provider Cross-Compare" in html_text
+    assert "Leaderboard Trend Graphs" in html_text
     assert "Leaderboard Charts" in html_text
     assert "No chart data available." in html_text
     assert "No completed report data found." in html_text

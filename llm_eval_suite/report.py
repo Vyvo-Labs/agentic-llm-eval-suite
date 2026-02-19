@@ -667,6 +667,142 @@ def _build_history_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _history_entry_sort_key(entry: dict[str, Any]) -> tuple[str, str]:
+    return (
+        str(entry.get("started_at", "")),
+        str(entry.get("run_dir_name", "")),
+    )
+
+
+def _mean_metric_for_entry(entry: dict[str, Any], metric_key: str) -> float | None:
+    model_summaries = entry.get("model_summaries", [])
+    if not isinstance(model_summaries, list):
+        return None
+
+    values = [
+        value
+        for value in (_as_float(summary.get(metric_key)) for summary in model_summaries if isinstance(summary, dict))
+        if value is not None
+    ]
+    return _mean(values)
+
+
+def _build_run_metric_series(entries: list[dict[str, Any]], metric_key: str) -> list[dict[str, Any]]:
+    series: list[dict[str, Any]] = []
+    for entry in sorted(entries, key=_history_entry_sort_key):
+        value = _mean_metric_for_entry(entry, metric_key)
+        if value is None:
+            continue
+
+        started_at = str(entry.get("started_at", "")).strip()
+        run_id = str(entry.get("run_id", "")).strip() or str(entry.get("run_dir_name", "")).strip() or "-"
+        day_key = str(entry.get("day_key", "")).strip()
+        short_label = (
+            day_key
+            if day_key and day_key != "unknown"
+            else started_at[:10]
+            if len(started_at) >= 10
+            else run_id
+        )
+        label = started_at or run_id
+        series.append(
+            {
+                "label": label,
+                "short_label": short_label,
+                "value": float(value),
+            }
+        )
+    return series
+
+
+def _build_model_metric_series(model_summaries: list[dict[str, Any]], metric_key: str) -> list[dict[str, Any]]:
+    series: list[dict[str, Any]] = []
+    for index, summary in enumerate(model_summaries, start=1):
+        value = _as_float(summary.get(metric_key))
+        if value is None:
+            continue
+        model_name = str(summary.get("model_name", "-"))
+        series.append(
+            {
+                "label": model_name,
+                "short_label": f"#{index}",
+                "value": float(value),
+            }
+        )
+    return series
+
+
+def _render_metric_trend_chart(
+    *,
+    series: list[dict[str, Any]],
+    title: str,
+    subtitle: str,
+    formatter: Any,
+    higher_is_better: bool,
+) -> str:
+    cleaned_points: list[tuple[str, str, float]] = []
+    for point in series:
+        value = _as_float(point.get("value"))
+        if value is None:
+            continue
+        label = str(point.get("label", "")).strip() or "-"
+        short_label = str(point.get("short_label", "")).strip() or label
+        cleaned_points.append((label, short_label, float(value)))
+
+    if not cleaned_points:
+        return (
+            f'<section class="chart trend-chart"><h3>{html.escape(title)}</h3>'
+            f'<p class="muted">{html.escape(subtitle)}</p>'
+            '<p class="muted">No chart data available.</p></section>'
+        )
+
+    values = [value for _, _, value in cleaned_points]
+    min_value = min(values)
+    max_value = max(values)
+    span = max_value - min_value
+
+    bars: list[str] = []
+    for index, (label, _, value) in enumerate(cleaned_points):
+        normalized = 1.0 if span <= 1e-12 else (value - min_value) / span
+        visual_ratio = normalized if higher_is_better else (1.0 - normalized)
+        height = 16.0 + (visual_ratio * 84.0)
+        tooltip = f"{label}: {formatter(value)}"
+        class_name = "trend-bar latest" if index == len(cleaned_points) - 1 else "trend-bar"
+        bars.append(
+            f'<span class="{class_name}" style="height:{height:.2f}%;" title="{html.escape(tooltip)}"></span>'
+        )
+
+    first_label = cleaned_points[0][1]
+    latest_label = cleaned_points[-1][1]
+    latest_value = cleaned_points[-1][2]
+    delta_text = "-"
+    if len(cleaned_points) > 1:
+        delta = latest_value - cleaned_points[0][2]
+        delta_formatted = _format_num(delta)
+        if delta > 0:
+            delta_formatted = f"+{delta_formatted}"
+        delta_text = delta_formatted
+
+    direction_text = "higher is better" if higher_is_better else "lower is better"
+    return "".join(
+        [
+            f'<section class="chart trend-chart"><h3>{html.escape(title)}</h3>',
+            f'<p class="muted">{html.escape(subtitle)}</p>',
+            f'<div class="trend-bars">{"".join(bars)}</div>',
+            '<div class="trend-meta">',
+            f'<span>Latest: <strong>{html.escape(formatter(latest_value))}</strong></span>',
+            f'<span>Range: {html.escape(formatter(min_value))} to {html.escape(formatter(max_value))}</span>',
+            f"<span>Delta: {html.escape(delta_text)}</span>",
+            "</div>",
+            (
+                f'<p class="muted trend-window">Window: {html.escape(first_label)} to '
+                f'{html.escape(latest_label)} ({len(cleaned_points)} points, {direction_text}).</p>'
+            ),
+            "</section>",
+        ]
+    )
+
+
 def _render_sortable_tables_script_lines() -> list[str]:
     return [
         "<script>",
@@ -791,6 +927,9 @@ def render_history_html(reports_root: Path) -> str:
     provider_row_count = int(metrics["provider_row_count"])
     provider_rows = list(metrics["provider_rows"])
     day_rows = list(metrics["day_rows"])
+    quality_trend_series = _build_run_metric_series(entries, "final_score_avg")
+    latency_trend_series = _build_run_metric_series(entries, "latency_p50_s")
+    tps_trend_series = _build_run_metric_series(entries, "tokens_per_s_p50")
 
     lines: list[str] = [
         "<!doctype html>",
@@ -827,6 +966,11 @@ def render_history_html(reports_root: Path) -> str:
         ".chart-row-top { display: flex; justify-content: space-between; gap: 12px; font-size: 0.9rem; }",
         ".bar { margin-top: 6px; height: 10px; border-radius: 999px; background: #e5e7eb; overflow: hidden; }",
         ".fill { display: block; height: 100%; background: linear-gradient(90deg, #22c55e, #2563eb); }",
+        ".trend-bars { display: flex; gap: 3px; align-items: flex-end; height: 126px; padding: 8px; border: 1px solid #dbeafe; border-radius: 10px; background: linear-gradient(180deg, #f8fbff, #eff6ff); overflow: hidden; }",
+        ".trend-bar { flex: 1; min-width: 2px; border-radius: 4px 4px 0 0; background: linear-gradient(180deg, #60a5fa, #2563eb); opacity: 0.78; }",
+        ".trend-bar.latest { background: linear-gradient(180deg, #34d399, #059669); opacity: 1; }",
+        ".trend-meta { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px 12px; font-size: 0.82rem; color: #334155; }",
+        ".trend-window { margin-top: 6px; font-size: 0.8rem; }",
         ".sortable th { user-select: none; }",
         ".sortable th.sortable-header { cursor: pointer; position: relative; padding-right: 18px; }",
         ".sortable th.sortable-header::after { content: '↕'; position: absolute; right: 6px; color: #94a3b8; font-size: 0.8rem; }",
@@ -981,6 +1125,41 @@ def render_history_html(reports_root: Path) -> str:
     else:
         lines.append('<p class="muted">No provider comparison data found.</p>')
     lines.append("</section>")
+
+    quality_trend_chart = _render_metric_trend_chart(
+        series=quality_trend_series,
+        title="Mean Quality Trend",
+        subtitle="Per-run mean of model final scores (quality).",
+        formatter=_format_num,
+        higher_is_better=True,
+    )
+    latency_trend_chart = _render_metric_trend_chart(
+        series=latency_trend_series,
+        title="Mean Latency Trend (p50 seconds)",
+        subtitle="Per-run mean latency across models.",
+        formatter=_format_num,
+        higher_is_better=False,
+    )
+    tps_trend_chart = _render_metric_trend_chart(
+        series=tps_trend_series,
+        title="Mean TPS Trend (tokens/s p50)",
+        subtitle="Per-run mean throughput across models.",
+        formatter=_format_num,
+        higher_is_better=True,
+    )
+    lines.extend(
+        [
+            '<section class="section">',
+            "<h2>Leaderboard Trend Graphs</h2>",
+            '<p class="muted">Leaderboard-style run history for mean quality, latency, and TPS.</p>',
+            '<div class="chart-grid">',
+            quality_trend_chart,
+            latency_trend_chart,
+            tps_trend_chart,
+            "</div>",
+            "</section>",
+        ]
+    )
 
     chart_rows = historical_leaderboard_rows[:12]
     score_chart = _render_metric_chart_rows(
@@ -1301,6 +1480,9 @@ def render_leaderboard_html(results: dict[str, Any]) -> str:
     top_model = model_summaries[0] if model_summaries else None
     top_model_name = str(top_model.get("model_name", "-")) if top_model else "-"
     top_model_score = _format_num(_as_float(top_model.get("final_score_avg")) if top_model else None)
+    quality_rank_series = _build_model_metric_series(model_summaries, "final_score_avg")
+    latency_rank_series = _build_model_metric_series(model_summaries, "latency_p50_s")
+    tps_rank_series = _build_model_metric_series(model_summaries, "tokens_per_s_p50")
 
     lines: list[str] = [
         "<!doctype html>",
@@ -1346,6 +1528,11 @@ def render_leaderboard_html(results: dict[str, Any]) -> str:
         ".chart-row-top { display: flex; justify-content: space-between; gap: 12px; font-size: 0.9rem; }",
         ".bar { margin-top: 6px; height: 10px; border-radius: 999px; background: #e5e7eb; overflow: hidden; }",
         ".fill { display: block; height: 100%; background: linear-gradient(90deg, #22c55e, #2563eb); }",
+        ".trend-bars { display: flex; gap: 3px; align-items: flex-end; height: 126px; padding: 8px; border: 1px solid #dbeafe; border-radius: 10px; background: linear-gradient(180deg, #f8fbff, #eff6ff); overflow: hidden; }",
+        ".trend-bar { flex: 1; min-width: 2px; border-radius: 4px 4px 0 0; background: linear-gradient(180deg, #60a5fa, #2563eb); opacity: 0.78; }",
+        ".trend-bar.latest { background: linear-gradient(180deg, #34d399, #059669); opacity: 1; }",
+        ".trend-meta { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px 12px; font-size: 0.82rem; color: #334155; }",
+        ".trend-window { margin-top: 6px; font-size: 0.8rem; }",
         ".explain-list { margin: 0; padding-left: 20px; }",
         ".warning-list, .failed-list { margin: 0; padding-left: 20px; }",
         "@media (max-width: 640px) { .page { padding: 12px; } .hero h1 { font-size: 1.55rem; } table { font-size: 0.84rem; } }",
@@ -1475,6 +1662,41 @@ def render_leaderboard_html(results: dict[str, Any]) -> str:
                 score_chart,
                 pass_chart,
                 latency_chart,
+                "</div>",
+                "</section>",
+            ]
+        )
+
+        quality_trend_chart = _render_metric_trend_chart(
+            series=quality_rank_series,
+            title="Mean Quality (Final Score Avg)",
+            subtitle="Models ordered by leaderboard rank for this run.",
+            formatter=_format_num,
+            higher_is_better=True,
+        )
+        latency_trend_chart = _render_metric_trend_chart(
+            series=latency_rank_series,
+            title="Mean Latency (p50 seconds)",
+            subtitle="Models ordered by leaderboard rank for this run.",
+            formatter=_format_num,
+            higher_is_better=False,
+        )
+        tps_trend_chart = _render_metric_trend_chart(
+            series=tps_rank_series,
+            title="Mean TPS (tokens/s p50)",
+            subtitle="Models ordered by leaderboard rank for this run.",
+            formatter=_format_num,
+            higher_is_better=True,
+        )
+        lines.extend(
+            [
+                '<section class="section">',
+                "<h2>Leaderboard Trend Graphs</h2>",
+                '<p class="muted">Leaderboard-style bars for mean quality, latency, and TPS.</p>',
+                '<div class="chart-grid">',
+                quality_trend_chart,
+                latency_trend_chart,
+                tps_trend_chart,
                 "</div>",
                 "</section>",
             ]
@@ -1725,6 +1947,22 @@ def render_detailed_report_html(
     models_with_prior_count = int(history_context.get("models_with_prior_count") or 0)
     mean_prior_winner_score = _as_float(history_context.get("mean_winner_score"))
     reports_root_text = str(history_context.get("reports_root") or "-")
+    trend_entries = list(prior_entries)
+    trend_entries.append(
+        {
+            "run_id": run_id,
+            "run_dir_name": current_run_dir_name or run_id,
+            "started_at": started_at,
+            "day_key": _derive_day_key(
+                started_at=started_at,
+                run_dir_name=current_run_dir_name or run_id,
+            ),
+            "model_summaries": model_summaries,
+        }
+    )
+    quality_trend_series = _build_run_metric_series(trend_entries, "final_score_avg")
+    latency_trend_series = _build_run_metric_series(trend_entries, "latency_p50_s")
+    tps_trend_series = _build_run_metric_series(trend_entries, "tokens_per_s_p50")
 
     model_failure_rows: list[tuple[str, int, int]] = []
     failure_by_model: dict[str, dict[str, int]] = {}
@@ -1773,6 +2011,13 @@ def render_detailed_report_html(
         ".kpi-grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }",
         ".kpi { background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 10px; padding: 10px; }",
         ".kpi strong { display: block; margin-bottom: 4px; }",
+        ".chart-grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }",
+        ".chart { border: 1px solid #e5e7eb; border-radius: 10px; background: #fbfdff; padding: 10px; }",
+        ".trend-bars { display: flex; gap: 3px; align-items: flex-end; height: 124px; padding: 8px; border: 1px solid #dbeafe; border-radius: 10px; background: linear-gradient(180deg, #f8fbff, #eff6ff); overflow: hidden; }",
+        ".trend-bar { flex: 1; min-width: 2px; border-radius: 4px 4px 0 0; background: linear-gradient(180deg, #60a5fa, #2563eb); opacity: 0.78; }",
+        ".trend-bar.latest { background: linear-gradient(180deg, #34d399, #059669); opacity: 1; }",
+        ".trend-meta { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px 12px; font-size: 0.8rem; color: #334155; }",
+        ".trend-window { margin-top: 6px; font-size: 0.78rem; }",
         ".table-wrap { overflow-x: auto; border: 1px solid #e5e7eb; border-radius: 10px; }",
         "table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }",
         "th, td { border-bottom: 1px solid #e5e7eb; text-align: left; padding: 8px; vertical-align: top; }",
@@ -1826,6 +2071,39 @@ def render_detailed_report_html(
             f'<div class="kpi"><strong>Mean Prior Winner Score</strong><div class="mono">{html.escape(_format_num(mean_prior_winner_score))}</div></div>',
             "</div>",
             f'<p class="muted small">Reports root: <span class="mono">{html.escape(reports_root_text)}</span></p>',
+        ]
+    )
+
+    quality_trend_chart = _render_metric_trend_chart(
+        series=quality_trend_series,
+        title="Mean Quality Trend",
+        subtitle="Mean final score per run (prior runs plus current).",
+        formatter=_format_num,
+        higher_is_better=True,
+    )
+    latency_trend_chart = _render_metric_trend_chart(
+        series=latency_trend_series,
+        title="Mean Latency Trend (p50 seconds)",
+        subtitle="Mean latency per run (prior runs plus current).",
+        formatter=_format_num,
+        higher_is_better=False,
+    )
+    tps_trend_chart = _render_metric_trend_chart(
+        series=tps_trend_series,
+        title="Mean TPS Trend (tokens/s p50)",
+        subtitle="Mean throughput per run (prior runs plus current).",
+        formatter=_format_num,
+        higher_is_better=True,
+    )
+    lines.extend(
+        [
+            "<h3>Leaderboard Trend Graphs</h3>",
+            '<p class="muted small">Trend bars for mean quality, latency, and TPS.</p>',
+            '<div class="chart-grid">',
+            quality_trend_chart,
+            latency_trend_chart,
+            tps_trend_chart,
+            "</div>",
         ]
     )
 
