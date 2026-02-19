@@ -23,12 +23,24 @@ def _base_run_args() -> argparse.Namespace:
         max_completion_tokens=None,
         reasoning_effort=None,
         output_dir=None,
-        detailed_pdf=False,
+        detailed_pdf=True,
         detailed_pdf_output=None,
         include_raw_output=False,
         cache=False,
         no_cache=False,
     )
+
+
+def test_run_parser_enables_detailed_pdf_by_default() -> None:
+    parser = cli._build_parser()
+    args = parser.parse_args(["run"])
+    assert args.detailed_pdf is True
+
+
+def test_run_parser_allows_disabling_detailed_pdf() -> None:
+    parser = cli._build_parser()
+    args = parser.parse_args(["run", "--no-detailed-pdf"])
+    assert args.detailed_pdf is False
 
 
 def test_report_command_generates_detailed_pdf_with_default_output(tmp_path: Path, monkeypatch) -> None:
@@ -153,7 +165,6 @@ def test_run_command_generates_detailed_pdf_with_default_output(tmp_path: Path, 
     monkeypatch.setattr(cli, "write_detailed_pdf_report", _fake_write)
 
     args = _base_run_args()
-    args.detailed_pdf = True
     exit_code = cli._run_command(args)
 
     assert exit_code == 0

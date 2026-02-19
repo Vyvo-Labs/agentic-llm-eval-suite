@@ -56,6 +56,16 @@ def _median(values: list[float]) -> float | None:
     return (ordered[middle - 1] + ordered[middle]) / 2.0
 
 
+def _stddev(values: list[float]) -> float | None:
+    if len(values) < 2:
+        return None
+    mean_value = _mean(values)
+    if mean_value is None:
+        return None
+    variance = sum((item - mean_value) ** 2 for item in values) / len(values)
+    return math.sqrt(variance)
+
+
 def _sort_value(value: float | None) -> str:
     if value is None:
         return ""
@@ -1543,7 +1553,147 @@ def render_leaderboard_html(results: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def render_detailed_report_html(results: dict[str, Any], include_raw_output: bool = False) -> str:
+def _is_same_run_entry(
+    entry: dict[str, Any],
+    *,
+    results: dict[str, Any],
+    current_run_dir_name: str | None,
+) -> bool:
+    entry_run_id = str(entry.get("run_id", "")).strip()
+    target_run_id = str(results.get("run_id", "")).strip()
+    if entry_run_id and target_run_id and entry_run_id == target_run_id:
+        return True
+
+    if current_run_dir_name:
+        run_dir_name = str(entry.get("run_dir_name", "")).strip()
+        if run_dir_name and run_dir_name == current_run_dir_name:
+            return True
+
+    entry_started_at = str(entry.get("started_at", "")).strip()
+    target_started_at = str(results.get("started_at", "")).strip()
+    if entry_started_at and target_started_at and entry_started_at == target_started_at:
+        entry_finished_at = str(entry.get("finished_at", "")).strip()
+        target_finished_at = str(results.get("finished_at", "")).strip()
+        if not target_finished_at or entry_finished_at == target_finished_at:
+            return True
+
+    return False
+
+
+def _build_detailed_history_context(
+    *,
+    results: dict[str, Any],
+    reports_root: Path | None,
+    current_run_dir_name: str | None,
+    max_prior_runs: int | None,
+) -> dict[str, Any]:
+    context: dict[str, Any] = {
+        "reports_root": str(reports_root) if reports_root is not None else None,
+        "prior_entries": [],
+        "prior_rows": [],
+        "prior_run_count": 0,
+        "prior_score_count": 0,
+        "models_with_prior_count": 0,
+        "mean_winner_score": None,
+    }
+    if reports_root is None:
+        return context
+
+    entries = _load_history_entries(reports_root)
+    if not entries:
+        return context
+
+    prior_entries = [
+        entry
+        for entry in entries
+        if not _is_same_run_entry(
+            entry,
+            results=results,
+            current_run_dir_name=current_run_dir_name,
+        )
+    ]
+
+    if max_prior_runs is not None:
+        max_runs = max(0, int(max_prior_runs))
+        if max_runs == 0:
+            prior_entries = []
+        elif len(prior_entries) > max_runs:
+            prior_entries = prior_entries[:max_runs]
+
+    context["prior_entries"] = prior_entries
+    context["prior_run_count"] = len(prior_entries)
+    if not prior_entries:
+        return context
+
+    prior_scores_by_model: dict[str, list[float]] = {}
+    for entry in prior_entries:
+        for summary in entry.get("model_summaries", []):
+            model_name = str(summary.get("model_name", "")).strip()
+            score = _as_float(summary.get("final_score_avg"))
+            if not model_name or score is None:
+                continue
+            prior_scores_by_model.setdefault(model_name, []).append(score)
+
+    winner_scores = [
+        score
+        for score in (_as_float(item.get("winner_score")) for item in prior_entries)
+        if score is not None
+    ]
+    context["mean_winner_score"] = _mean(winner_scores)
+    context["prior_score_count"] = sum(len(values) for values in prior_scores_by_model.values())
+
+    prior_rows: list[dict[str, Any]] = []
+    models_with_prior_count = 0
+    for summary in _sorted_model_summaries(results):
+        model_name = str(summary.get("model_name", "")).strip()
+        if not model_name:
+            continue
+        current_final = _as_float(summary.get("final_score_avg"))
+        prior_scores = [float(item) for item in prior_scores_by_model.get(model_name, [])]
+        prior_samples = len(prior_scores)
+        if prior_samples > 0:
+            models_with_prior_count += 1
+        prior_mean = _mean(prior_scores)
+        prior_stddev = _stddev(prior_scores)
+        prior_ci95 = (
+            (1.96 * prior_stddev / math.sqrt(prior_samples))
+            if prior_stddev is not None and prior_samples > 1
+            else None
+        )
+
+        prior_rows.append(
+            {
+                "model_name": model_name,
+                "current_final_score": current_final,
+                "prior_samples": prior_samples,
+                "prior_mean_score": prior_mean,
+                "prior_stddev_score": prior_stddev,
+                "prior_ci95_score": prior_ci95,
+                "prior_median_score": _median(prior_scores),
+                "prior_min_score": min(prior_scores) if prior_scores else None,
+                "prior_max_score": max(prior_scores) if prior_scores else None,
+                "latest_prior_score": prior_scores[0] if prior_scores else None,
+                "delta_vs_prior_mean": (
+                    (current_final - prior_mean)
+                    if current_final is not None and prior_mean is not None
+                    else None
+                ),
+            }
+        )
+
+    context["prior_rows"] = prior_rows
+    context["models_with_prior_count"] = models_with_prior_count
+    return context
+
+
+def render_detailed_report_html(
+    results: dict[str, Any],
+    include_raw_output: bool = False,
+    *,
+    reports_root: Path | None = None,
+    current_run_dir_name: str | None = None,
+    max_prior_runs: int | None = 20,
+) -> str:
     run_id = str(results.get("run_id", "unknown"))
     started_at = str(results.get("started_at", "unknown"))
     finished_at = str(results.get("finished_at", "unknown"))

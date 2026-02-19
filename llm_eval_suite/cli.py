@@ -41,7 +41,12 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--max-completion-tokens", type=int, help="Max completion tokens per response")
     run_parser.add_argument("--reasoning-effort", help="Override reasoning effort")
     run_parser.add_argument("--output-dir", type=Path, help="Output directory for reports")
-    run_parser.add_argument("--detailed-pdf", action="store_true", help="Export detailed run PDF report")
+    run_parser.add_argument(
+        "--detailed-pdf",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Export detailed run PDF report (default: enabled; use --no-detailed-pdf to disable)",
+    )
     run_parser.add_argument(
         "--detailed-pdf-output",
         type=Path,
