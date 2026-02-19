@@ -57,6 +57,17 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include raw model outputs in detailed PDF appendix",
     )
+    run_parser.add_argument(
+        "--history-reports-dir",
+        type=Path,
+        help="Reports root used to collect prior scores for detailed PDF (default: output dir)",
+    )
+    run_parser.add_argument(
+        "--history-max-runs",
+        type=int,
+        default=20,
+        help="Max number of prior runs to include in detailed PDF historical scoring section (default: 20)",
+    )
     run_parser.add_argument("--cache", action="store_true", help="Force-enable cache")
     run_parser.add_argument("--no-cache", action="store_true", help="Disable cache")
 
@@ -77,6 +88,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--include-raw-output",
         action="store_true",
         help="Include raw model outputs in detailed PDF appendix",
+    )
+    report_parser.add_argument(
+        "--history-reports-dir",
+        type=Path,
+        help="Reports root used to collect prior scores for detailed PDF (default: parent of run directory)",
+    )
+    report_parser.add_argument(
+        "--history-max-runs",
+        type=int,
+        default=20,
+        help="Max number of prior runs to include in detailed PDF historical scoring section (default: 20)",
     )
 
     history_parser = subparsers.add_parser("history", help="Generate day-by-day reports dashboard HTML")
@@ -138,10 +160,14 @@ def _run_command(args: argparse.Namespace) -> int:
     detailed_pdf_output = args.detailed_pdf_output or (run_dir / "leaderboard_detailed.pdf")
     detailed_pdf_written = False
     if detailed_pdf_requested:
+        history_reports_root = args.history_reports_dir or config.output_dir
         detailed_pdf_written = write_detailed_pdf_report(
             payload,
             detailed_pdf_output,
             include_raw_output=bool(args.include_raw_output),
+            reports_root=history_reports_root,
+            current_run_dir_name=run_dir.name,
+            max_prior_runs=max(0, int(args.history_max_runs)),
         )
 
     print(f"Benchmark run completed: {run_dir}")
@@ -209,10 +235,14 @@ def _report_command(args: argparse.Namespace) -> int:
     if detailed_pdf_requested:
         payload = json.loads(args.input.read_text(encoding="utf-8"))
         detailed_pdf_output = args.detailed_pdf_output or (args.input.parent / "leaderboard_detailed.pdf")
+        history_reports_root = args.history_reports_dir or args.input.parent.parent
         detailed_pdf_written = write_detailed_pdf_report(
             payload,
             detailed_pdf_output,
             include_raw_output=bool(args.include_raw_output),
+            reports_root=history_reports_root,
+            current_run_dir_name=args.input.parent.name,
+            max_prior_runs=max(0, int(args.history_max_runs)),
         )
         if detailed_pdf_written:
             print(f"Wrote detailed PDF report: {detailed_pdf_output}")

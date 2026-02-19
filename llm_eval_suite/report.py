@@ -1712,6 +1712,19 @@ def render_detailed_report_html(
     fail_count = max(0, total_cases - pass_count)
     pass_rate = (pass_count / total_cases) if total_cases else None
     execution_error_count = len(execution_errors)
+    history_context = _build_detailed_history_context(
+        results=results,
+        reports_root=reports_root,
+        current_run_dir_name=current_run_dir_name,
+        max_prior_runs=max_prior_runs,
+    )
+    prior_entries = list(history_context.get("prior_entries", []))
+    prior_rows = list(history_context.get("prior_rows", []))
+    prior_run_count = int(history_context.get("prior_run_count") or 0)
+    prior_score_count = int(history_context.get("prior_score_count") or 0)
+    models_with_prior_count = int(history_context.get("models_with_prior_count") or 0)
+    mean_prior_winner_score = _as_float(history_context.get("mean_winner_score"))
+    reports_root_text = str(history_context.get("reports_root") or "-")
 
     model_failure_rows: list[tuple[str, int, int]] = []
     failure_by_model: dict[str, dict[str, int]] = {}
@@ -1767,6 +1780,9 @@ def render_detailed_report_html(
         ".case-card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 11px; margin-bottom: 10px; background: #fcfdff; }",
         ".case-meta { margin: 0 0 8px 0; font-size: 0.88rem; color: #374151; }",
         ".case-error { color: #b91c1c; }",
+        ".positive { color: #166534; }",
+        ".negative { color: #b91c1c; }",
+        ".small { font-size: 0.82rem; }",
         ".output { margin: 0; padding: 9px; border-radius: 8px; border: 1px solid #d1d5db; background: #0f172a; color: #e5e7eb; white-space: pre-wrap; word-break: break-word; font-size: 0.82rem; }",
         ".page-break { break-before: page; page-break-before: always; }",
         "@media print { body { background: #fff; } .page { max-width: none; padding: 12mm; } .section { box-shadow: none; } }",
@@ -1796,10 +1812,101 @@ def render_detailed_report_html(
         f'<div class="kpi"><strong>Warnings</strong><div class="mono">{len(warnings)}</div></div>',
         "</div>",
         "</section>",
-        '<section class="section">',
-        "<h2>Leaderboard</h2>",
-        "<p class=\"muted\">Model ranking by final score with quality and performance metrics.</p>",
     ]
+
+    lines.extend(
+        [
+            '<section class="section">',
+            "<h2>Historical Reliability</h2>",
+            "<p class=\"muted\">Current scores compared against prior runs to reduce single-run noise.</p>",
+            '<div class="kpi-grid">',
+            f'<div class="kpi"><strong>Prior Runs Used</strong><div class="mono">{prior_run_count}</div></div>',
+            f'<div class="kpi"><strong>Prior Model Scores</strong><div class="mono">{prior_score_count}</div></div>',
+            f'<div class="kpi"><strong>Models With Prior Data</strong><div class="mono">{models_with_prior_count}/{len(model_summaries)}</div></div>',
+            f'<div class="kpi"><strong>Mean Prior Winner Score</strong><div class="mono">{html.escape(_format_num(mean_prior_winner_score))}</div></div>',
+            "</div>",
+            f'<p class="muted small">Reports root: <span class="mono">{html.escape(reports_root_text)}</span></p>',
+        ]
+    )
+
+    if prior_rows and prior_run_count > 0:
+        lines.extend(
+            [
+                "<h3>Current vs Prior Score Distribution</h3>",
+                '<div class="table-wrap">',
+                "<table>",
+                "<thead><tr>"
+                "<th>Rank</th><th>Model</th><th>Current Final</th><th>Prior Samples</th><th>Prior Mean</th>"
+                "<th>Prior StdDev</th><th>95% CI</th><th>Prior Median</th><th>Prior Min/Max</th><th>Latest Prior</th>"
+                "<th>Delta vs Prior Mean</th>"
+                "</tr></thead>",
+                "<tbody>",
+            ]
+        )
+        for rank, row in enumerate(prior_rows, start=1):
+            delta = _as_float(row.get("delta_vs_prior_mean"))
+            delta_text = _format_num(delta)
+            if delta is not None and delta > 0:
+                delta_text = f"+{delta_text}"
+            delta_class = (
+                "positive"
+                if delta is not None and delta > 0
+                else "negative"
+                if delta is not None and delta < 0
+                else ""
+            )
+            lines.append(
+                "<tr>"
+                f"<td>{rank}</td>"
+                f'<td class="mono">{html.escape(str(row.get("model_name", "-")))}</td>'
+                f"<td>{html.escape(_format_num(_as_float(row.get('current_final_score'))))}</td>"
+                f"<td>{int(row.get('prior_samples') or 0)}</td>"
+                f"<td>{html.escape(_format_num(_as_float(row.get('prior_mean_score'))))}</td>"
+                f"<td>{html.escape(_format_num(_as_float(row.get('prior_stddev_score'))))}</td>"
+                f"<td>{html.escape(_format_num(_as_float(row.get('prior_ci95_score'))))}</td>"
+                f"<td>{html.escape(_format_num(_as_float(row.get('prior_median_score'))))}</td>"
+                f"<td>{html.escape(_format_num(_as_float(row.get('prior_min_score'))))}/"
+                f"{html.escape(_format_num(_as_float(row.get('prior_max_score'))))}</td>"
+                f"<td>{html.escape(_format_num(_as_float(row.get('latest_prior_score'))))}</td>"
+                f'<td class="{delta_class}">{html.escape(delta_text)}</td>'
+                "</tr>"
+            )
+        lines.extend(["</tbody>", "</table>", "</div>"])
+
+        lines.extend(
+            [
+                "<h3>Recent Prior Runs</h3>",
+                '<div class="table-wrap">',
+                "<table>",
+                "<thead><tr>"
+                "<th>Run</th><th>Started</th><th>Winner</th><th>Winner Score</th><th>Models</th><th>Cases</th>"
+                "</tr></thead>",
+                "<tbody>",
+            ]
+        )
+        for entry in prior_entries[:15]:
+            lines.append(
+                "<tr>"
+                f'<td class="mono">{html.escape(str(entry.get("run_id", "-")))}</td>'
+                f'<td class="mono">{html.escape(str(entry.get("started_at", "-")))}</td>'
+                f'<td class="mono">{html.escape(str(entry.get("winner_label", entry.get("winner_model", "-"))))}</td>'
+                f"<td>{html.escape(_format_num(_as_float(entry.get('winner_score'))))}</td>"
+                f"<td>{int(entry.get('model_count') or 0)}</td>"
+                f"<td>{int(entry.get('case_count') or 0)}</td>"
+                "</tr>"
+            )
+        lines.extend(["</tbody>", "</table>", "</div>"])
+    else:
+        lines.append('<p class="muted">No prior run data found for historical score comparison.</p>')
+
+    lines.extend(
+        [
+            "</section>",
+            '<section class="section">',
+            "<h2>Leaderboard</h2>",
+            "<p class=\"muted\">Model ranking by final score with quality and performance metrics.</p>",
+        ]
+    )
 
     if not model_summaries:
         lines.append('<p class="muted">No model results were generated.</p>')
@@ -1973,9 +2080,24 @@ def write_detailed_pdf_report(
     output_path: Path,
     *,
     include_raw_output: bool = False,
+    reports_root: Path | None = None,
+    current_run_dir_name: str | None = None,
+    max_prior_runs: int | None = 20,
 ) -> bool:
+    resolved_reports_root = reports_root
+    if resolved_reports_root is None:
+        run_dir_candidate = output_path.parent
+        if (run_dir_candidate / "results.json").exists():
+            resolved_reports_root = run_dir_candidate.parent
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    html_content = render_detailed_report_html(results, include_raw_output=include_raw_output)
+    html_content = render_detailed_report_html(
+        results,
+        include_raw_output=include_raw_output,
+        reports_root=resolved_reports_root,
+        current_run_dir_name=current_run_dir_name,
+        max_prior_runs=max_prior_runs,
+    )
 
     temp_html_path: Path | None = None
     try:

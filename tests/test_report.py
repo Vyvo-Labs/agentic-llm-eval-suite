@@ -137,6 +137,72 @@ def test_render_detailed_report_html_raw_output_toggle() -> None:
     assert "partial output" in html_output
 
 
+def test_render_detailed_report_html_includes_historical_score_context(tmp_path: Path) -> None:
+    reports_root = tmp_path / "reports"
+    run_a = reports_root / "20260101T000000Z"
+    run_b = reports_root / "20260102T000000Z"
+    run_current = reports_root / "20260103T000000Z"
+    run_a.mkdir(parents=True)
+    run_b.mkdir(parents=True)
+    run_current.mkdir(parents=True)
+
+    payload_a = {
+        "run_id": "old-a",
+        "started_at": "2026-01-01T00:00:00Z",
+        "finished_at": "2026-01-01T00:01:00Z",
+        "datasets": [],
+        "model_summaries": [
+            {"model_name": "openai/gpt-5-mini", "final_score_avg": 0.80},
+            {"model_name": "openrouter/qwen", "final_score_avg": 0.60},
+        ],
+        "case_results": [{}, {}],
+        "warnings": [],
+    }
+    payload_b = {
+        "run_id": "old-b",
+        "started_at": "2026-01-02T00:00:00Z",
+        "finished_at": "2026-01-02T00:01:00Z",
+        "datasets": [],
+        "model_summaries": [
+            {"model_name": "openai/gpt-5-mini", "final_score_avg": 0.90},
+            {"model_name": "openrouter/qwen", "final_score_avg": 0.70},
+        ],
+        "case_results": [{}, {}],
+        "warnings": [],
+    }
+    payload_current = {
+        "run_id": "should-be-excluded",
+        "started_at": "2026-01-03T00:00:00Z",
+        "finished_at": "2026-01-03T00:01:00Z",
+        "datasets": [],
+        "model_summaries": [
+            {"model_name": "openai/gpt-5-mini", "final_score_avg": 0.10},
+            {"model_name": "openrouter/qwen", "final_score_avg": 0.10},
+        ],
+        "case_results": [{}],
+        "warnings": [],
+    }
+    (run_a / "results.json").write_text(json.dumps(payload_a), encoding="utf-8")
+    (run_b / "results.json").write_text(json.dumps(payload_b), encoding="utf-8")
+    (run_current / "results.json").write_text(json.dumps(payload_current), encoding="utf-8")
+
+    html_output = render_detailed_report_html(
+        _sample_results(),
+        reports_root=reports_root,
+        current_run_dir_name=run_current.name,
+        max_prior_runs=20,
+    )
+
+    assert "<h2>Historical Reliability</h2>" in html_output
+    assert "Current vs Prior Score Distribution" in html_output
+    assert "Recent Prior Runs" in html_output
+    assert "Prior Runs Used</strong><div class=\"mono\">2</div>" in html_output
+    assert "old-a" in html_output
+    assert "old-b" in html_output
+    assert "should-be-excluded" not in html_output
+    assert "+0.030" in html_output
+
+
 def test_report_regeneration_writes_markdown_and_html(tmp_path: Path) -> None:
     results_path = tmp_path / "results.json"
     results_path.write_text(json.dumps(_sample_results()), encoding="utf-8")

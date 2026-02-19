@@ -26,6 +26,8 @@ def _base_run_args() -> argparse.Namespace:
         detailed_pdf=True,
         detailed_pdf_output=None,
         include_raw_output=False,
+        history_reports_dir=None,
+        history_max_runs=20,
         cache=False,
         no_cache=False,
     )
@@ -68,10 +70,21 @@ def test_report_command_generates_detailed_pdf_with_default_output(tmp_path: Pat
 
     captured: dict[str, object] = {}
 
-    def _fake_write(payload: dict[str, object], output_path: Path, *, include_raw_output: bool = False) -> bool:
+    def _fake_write(
+        payload: dict[str, object],
+        output_path: Path,
+        *,
+        include_raw_output: bool = False,
+        reports_root: Path | None = None,
+        current_run_dir_name: str | None = None,
+        max_prior_runs: int | None = None,
+    ) -> bool:
         captured["payload"] = payload
         captured["output_path"] = output_path
         captured["include_raw_output"] = include_raw_output
+        captured["reports_root"] = reports_root
+        captured["current_run_dir_name"] = current_run_dir_name
+        captured["max_prior_runs"] = max_prior_runs
         return True
 
     monkeypatch.setattr(cli, "write_detailed_pdf_report", _fake_write)
@@ -83,12 +96,17 @@ def test_report_command_generates_detailed_pdf_with_default_output(tmp_path: Pat
         detailed_pdf=True,
         detailed_pdf_output=None,
         include_raw_output=True,
+        history_reports_dir=None,
+        history_max_runs=20,
     )
     exit_code = cli._report_command(args)
 
     assert exit_code == 0
     assert captured["output_path"] == tmp_path / "leaderboard_detailed.pdf"
     assert captured["include_raw_output"] is True
+    assert captured["reports_root"] == tmp_path.parent
+    assert captured["current_run_dir_name"] == tmp_path.name
+    assert captured["max_prior_runs"] == 20
 
 
 def test_report_command_detailed_pdf_fail_soft(tmp_path: Path, monkeypatch) -> None:
@@ -121,6 +139,8 @@ def test_report_command_detailed_pdf_fail_soft(tmp_path: Path, monkeypatch) -> N
         detailed_pdf=True,
         detailed_pdf_output=tmp_path / "custom.pdf",
         include_raw_output=False,
+        history_reports_dir=None,
+        history_max_runs=20,
     )
     exit_code = cli._report_command(args)
 
@@ -157,9 +177,20 @@ def test_run_command_generates_detailed_pdf_with_default_output(tmp_path: Path, 
 
     captured: dict[str, object] = {}
 
-    def _fake_write(_payload: dict[str, object], output_path: Path, *, include_raw_output: bool = False) -> bool:
+    def _fake_write(
+        _payload: dict[str, object],
+        output_path: Path,
+        *,
+        include_raw_output: bool = False,
+        reports_root: Path | None = None,
+        current_run_dir_name: str | None = None,
+        max_prior_runs: int | None = None,
+    ) -> bool:
         captured["output_path"] = output_path
         captured["include_raw_output"] = include_raw_output
+        captured["reports_root"] = reports_root
+        captured["current_run_dir_name"] = current_run_dir_name
+        captured["max_prior_runs"] = max_prior_runs
         return True
 
     monkeypatch.setattr(cli, "write_detailed_pdf_report", _fake_write)
@@ -170,3 +201,6 @@ def test_run_command_generates_detailed_pdf_with_default_output(tmp_path: Path, 
     assert exit_code == 0
     assert captured["output_path"] == run_dir / "leaderboard_detailed.pdf"
     assert captured["include_raw_output"] is False
+    assert captured["reports_root"] == config.output_dir
+    assert captured["current_run_dir_name"] == run_dir.name
+    assert captured["max_prior_runs"] == 20
