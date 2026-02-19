@@ -1,3 +1,4 @@
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -85,6 +86,59 @@ CHAT_INTELLIGENCE_CASE_IDS = {
     "mt_error_acknowledge_and_recover",
 }
 
+V3_CASE_IDS = {
+    "st_generated_v3_reasoning_01",
+    "st_generated_v3_reasoning_02",
+    "st_generated_v3_reasoning_03",
+    "st_generated_v3_reasoning_04",
+    "st_generated_v3_extraction_01",
+    "st_generated_v3_extraction_02",
+    "st_generated_v3_extraction_03",
+    "st_generated_v3_extraction_04",
+    "st_generated_v3_safety_01",
+    "st_generated_v3_safety_02",
+    "st_generated_v3_safety_03",
+    "st_generated_v3_safety_04",
+    "st_generated_v3_instruction_01",
+    "st_generated_v3_instruction_02",
+    "st_generated_v3_instruction_03",
+    "st_generated_v3_instruction_04",
+    "st_generated_v3_tooling_01",
+    "st_generated_v3_tooling_02",
+    "st_generated_v3_tooling_03",
+    "st_generated_v3_tooling_04",
+    "mt_generated_v3_reasoning_01",
+    "mt_generated_v3_reasoning_02",
+    "mt_generated_v3_reasoning_03",
+    "mt_generated_v3_reasoning_04",
+    "mt_generated_v3_extraction_01",
+    "mt_generated_v3_extraction_02",
+    "mt_generated_v3_extraction_03",
+    "mt_generated_v3_extraction_04",
+    "mt_generated_v3_safety_01",
+    "mt_generated_v3_safety_02",
+    "mt_generated_v3_safety_03",
+    "mt_generated_v3_safety_04",
+    "mt_generated_v3_instruction_01",
+    "mt_generated_v3_instruction_02",
+    "mt_generated_v3_instruction_03",
+    "mt_generated_v3_instruction_04",
+    "mt_generated_v3_tooling_01",
+    "mt_generated_v3_tooling_02",
+    "mt_generated_v3_tooling_03",
+    "mt_generated_v3_tooling_04",
+}
+
+
+def _deterministic_check_count(case: object) -> int:
+    expected = case.expected
+    return (
+        len(expected.exact)
+        + len(expected.regex)
+        + len(expected.must_include)
+        + (1 if expected.json_valid else 0)
+    )
+
 
 def test_load_cases_schema_v1(tmp_path: Path) -> None:
     dataset = tmp_path / "cases.yaml"
@@ -131,7 +185,7 @@ cases:
 
 def test_project_datasets_have_expanded_case_count() -> None:
     cases = load_cases(PROJECT_DATASETS)
-    assert len(cases) >= 67
+    assert len(cases) >= 127
 
 
 def test_new_cases_exist_and_have_minimum_deterministic_signal() -> None:
@@ -140,15 +194,6 @@ def test_new_cases_exist_and_have_minimum_deterministic_signal() -> None:
 
     missing_ids = [case_id for case_id in NEW_CASE_IDS if case_id not in by_id]
     assert not missing_ids
-
-    def _deterministic_check_count(case: object) -> int:
-        expected = case.expected
-        return (
-            len(expected.exact)
-            + len(expected.regex)
-            + len(expected.must_include)
-            + (1 if expected.json_valid else 0)
-        )
 
     for case_id in NEW_CASE_IDS:
         assert _deterministic_check_count(by_id[case_id]) >= 2
@@ -183,13 +228,47 @@ def test_chat_intelligence_cases_are_multi_turn_and_judge_heavy() -> None:
     assert sum(1 for case in selected if case.judge_rubric.force) >= 10
     assert sum(1 for case in selected if case.weights.judge >= 0.6) >= 10
 
-    def _deterministic_check_count(case: object) -> int:
-        expected = case.expected
-        return (
-            len(expected.exact)
-            + len(expected.regex)
-            + len(expected.must_include)
-            + (1 if expected.json_valid else 0)
-        )
-
     assert all(_deterministic_check_count(case) >= 2 for case in selected)
+
+
+def test_v3_cases_exist_and_have_minimum_deterministic_signal() -> None:
+    cases = load_cases(PROJECT_DATASETS)
+    by_id = {case.id: case for case in cases}
+
+    missing_ids = [case_id for case_id in V3_CASE_IDS if case_id not in by_id]
+    assert not missing_ids
+
+    selected = [by_id[case_id] for case_id in V3_CASE_IDS]
+    assert len(selected) == 40
+    assert all(_deterministic_check_count(case) >= 2 for case in selected)
+
+
+def test_v3_cases_are_balanced_by_type_and_category() -> None:
+    cases = load_cases(PROJECT_DATASETS)
+    selected = [case for case in cases if case.id in V3_CASE_IDS]
+
+    assert len(selected) == 40
+    assert sum(1 for case in selected if case.type == "single_turn") == 20
+    assert sum(1 for case in selected if case.type == "multi_turn") == 20
+
+    by_category = Counter(case.category for case in selected)
+    assert by_category == {
+        "reasoning": 8,
+        "extraction": 8,
+        "safety": 8,
+        "instruction-following": 8,
+        "tooling": 8,
+    }
+
+
+def test_v3_cases_have_balanced_weight_profiles() -> None:
+    cases = load_cases(PROJECT_DATASETS)
+    selected = [case for case in cases if case.id in V3_CASE_IDS]
+
+    deterministic_heavy = sum(
+        1 for case in selected if case.weights.deterministic > case.weights.judge
+    )
+    judge_heavy = sum(1 for case in selected if case.weights.judge > case.weights.deterministic)
+
+    assert deterministic_heavy == 20
+    assert judge_heavy == 20
