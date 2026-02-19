@@ -63,8 +63,25 @@ class LLMJudge:
             candidate_response=candidate_response,
         )
 
-        client = OpenAI(api_key=self._endpoint.api_key, base_url=self._endpoint.base_url)
-        response_text, error = self._request_judgment(client=client, prompt=prompt)
+        try:
+            client = OpenAI(api_key=self._endpoint.api_key, base_url=self._endpoint.base_url)
+        except Exception as exc:  # noqa: BLE001
+            return JudgeScore(
+                final_score=None,
+                criterion_scores=[],
+                flags=["judge_request_error"],
+                rationale="Judge request failed.",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        try:
+            response_text, error = self._request_judgment(client=client, prompt=prompt)
+        finally:
+            close_fn = getattr(client, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:  # noqa: BLE001
+                    pass
         if error is not None:
             return JudgeScore(
                 final_score=None,

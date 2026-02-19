@@ -191,6 +191,26 @@ def test_evaluate_returns_request_error_when_request_fails(monkeypatch: pytest.M
     assert result.error == "boom"
 
 
+def test_evaluate_returns_request_error_when_client_init_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    judge = _judge()
+
+    class _FakeOpenAI:
+        def __init__(self, **_: object) -> None:
+            raise OSError("Too many open files")
+
+    monkeypatch.setattr(judge_mod, "OpenAI", _FakeOpenAI)
+
+    result = judge.evaluate(
+        case=_case(criteria=["quality"]),
+        conversation_messages=[{"role": "user", "content": "hello"}],
+        candidate_response="answer",
+    )
+
+    assert result.final_score is None
+    assert result.flags == ["judge_request_error"]
+    assert "Too many open files" in (result.error or "")
+
+
 def test_request_judgment_retries_transient_connection_error(monkeypatch: pytest.MonkeyPatch) -> None:
     judge = _judge()
 

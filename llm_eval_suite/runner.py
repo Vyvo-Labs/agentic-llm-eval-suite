@@ -20,7 +20,6 @@ from .dataset_loader import load_cases
 from .judge import JudgeRuntimeConfig, LLMJudge
 from .models import (
     CaseResult,
-    DeterministicScore,
     InferenceResult,
     ModelSummary,
     RunResults,
@@ -35,6 +34,11 @@ from .providers import (
 )
 from .report import write_history_report, write_reports
 from .scoring import combine_scores, evaluate_deterministic
+
+try:
+    import resource
+except Exception:  # pragma: no cover - unavailable on some platforms (e.g., Windows)
+    resource = None  # type: ignore[assignment]
 
 PASS_THRESHOLD = 0.8
 _TRANSIENT_ERROR_HINTS: tuple[str, ...] = (
@@ -52,6 +56,8 @@ _TRANSIENT_ERROR_HINTS: tuple[str, ...] = (
 )
 _REQUEST_RETRY_ATTEMPTS = 3
 _REQUEST_RETRY_BASE_BACKOFF_S = 0.6
+_FD_RESERVE = 64
+_FD_BUDGET_PER_WORKER = 4
 
 
 @dataclass(slots=True)
@@ -301,6 +307,46 @@ def _chat_create_with_retries(
     raise RuntimeError("request failed without explicit error")
 
 
+def _close_client(client: Any) -> None:
+    close_fn = getattr(client, "close", None)
+    if callable(close_fn):
+        try:
+            close_fn()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _fd_soft_limit() -> int | None:
+    if resource is None:
+        return None
+    try:
+        soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(soft_limit, int):
+        return None
+    if soft_limit <= 0 or soft_limit >= 10_000_000:
+        return None
+    return soft_limit
+
+
+def _resolve_worker_concurrency(requested_concurrency: int) -> tuple[int, str | None]:
+    requested = max(1, int(requested_concurrency))
+    soft_limit = _fd_soft_limit()
+    if soft_limit is None:
+        return requested, None
+
+    safe_max = max(1, (soft_limit - _FD_RESERVE) // _FD_BUDGET_PER_WORKER)
+    if requested <= safe_max:
+        return requested, None
+
+    warning = (
+        f"Capping concurrency from {requested} to {safe_max} due to open-file soft limit ({soft_limit}). "
+        "Increase `ulimit -n` to allow higher concurrency."
+    )
+    return safe_max, warning
+
+
 def _call_model_once(
     *,
     endpoint: LLMEndpoint,
@@ -310,100 +356,67 @@ def _call_model_once(
     reasoning_effort: str | None,
     temperature: float | None,
 ) -> InferenceResult:
-    client = OpenAI(api_key=endpoint.api_key, base_url=endpoint.base_url)
-
-    request_base: dict[str, Any] = {
-        "model": endpoint.request_model,
-        "messages": messages,
-        "timeout": timeout_s,
-        "max_completion_tokens": max_completion_tokens,
-    }
-    if reasoning_effort:
-        request_base["reasoning_effort"] = reasoning_effort
-    if temperature is not None:
-        request_base["temperature"] = temperature
-
-    stream_attempt = dict(request_base)
-    stream_attempt["stream"] = True
-    stream_attempt["stream_options"] = {"include_usage": True}
-
-    start = time.perf_counter()
-    fragments: list[str] = []
-    ttft_s: float | None = None
-    usage = UsageStats()
-
-    stream_error: str | None = None
-    stream = None
     try:
-        stream = _chat_create_with_retries(client=client, request_payload=stream_attempt)
-        for chunk in stream:
-            now = time.perf_counter()
-            if now - start > timeout_s:
-                raise TimeoutError(f"stream response exceeded timeout_s={timeout_s}")
-            raw_chunk_usage = getattr(chunk, "usage", None)
-            if raw_chunk_usage is not None:
-                usage = _extract_usage(raw_chunk_usage)
-
-            choices = getattr(chunk, "choices", None)
-            if not choices:
-                continue
-            delta = getattr(choices[0], "delta", None)
-            content = getattr(delta, "content", None) if delta is not None else None
-            text_piece = _extract_text_payload(content)
-            if text_piece:
-                fragments.append(text_piece)
-                if ttft_s is None:
-                    ttft_s = now - start
-
-        total_latency_s = time.perf_counter() - start
-        output_text = "".join(fragments).strip()
-
-        if _stream_output_requires_retry(output_text):
-            stream_error = "stream output incomplete; retrying non-stream request"
-            raise RuntimeError(stream_error)
-
-        completion_tokens = usage.llm_completion_tokens
-        tokens_per_s = (
-            (completion_tokens / total_latency_s)
-            if completion_tokens > 0 and total_latency_s > 0
-            else None
-        )
-
-        if ttft_s is None:
-            ttft_s = total_latency_s
-
+        client = OpenAI(api_key=endpoint.api_key, base_url=endpoint.base_url)
+    except Exception as exc:  # noqa: BLE001
         return InferenceResult(
-            output_text=output_text,
-            ttft_s=ttft_s,
-            total_latency_s=total_latency_s,
-            tokens_per_s=tokens_per_s,
-            usage=usage,
+            output_text="",
+            ttft_s=None,
+            total_latency_s=0.0,
+            tokens_per_s=None,
+            usage=UsageStats(),
+            error=f"{type(exc).__name__}: {exc}",
         )
-    except Exception as stream_exc:  # noqa: BLE001
-        # Fall back to non-stream request for providers that do not support stream semantics.
-        stream_error = f"{type(stream_exc).__name__}: {stream_exc}"
-    finally:
-        close_fn = getattr(stream, "close", None)
-        if callable(close_fn):
-            try:
-                close_fn()
-            except Exception:  # noqa: BLE001
-                pass
+    try:
+        request_base: dict[str, Any] = {
+            "model": endpoint.request_model,
+            "messages": messages,
+            "timeout": timeout_s,
+            "max_completion_tokens": max_completion_tokens,
+        }
+        if reasoning_effort:
+            request_base["reasoning_effort"] = reasoning_effort
+        if temperature is not None:
+            request_base["temperature"] = temperature
 
-    attempts = _build_request_attempts(request_base)
-    last_error = stream_error
-    for attempt in attempts:
+        stream_attempt = dict(request_base)
+        stream_attempt["stream"] = True
+        stream_attempt["stream_options"] = {"include_usage": True}
+
+        start = time.perf_counter()
+        fragments: list[str] = []
+        ttft_s: float | None = None
+        usage = UsageStats()
+
+        stream_error: str | None = None
+        stream = None
         try:
-            started = time.perf_counter()
-            response = _chat_create_with_retries(client=client, request_payload=attempt)
-            total_latency_s = time.perf_counter() - started
+            stream = _chat_create_with_retries(client=client, request_payload=stream_attempt)
+            for chunk in stream:
+                now = time.perf_counter()
+                if now - start > timeout_s:
+                    raise TimeoutError(f"stream response exceeded timeout_s={timeout_s}")
+                raw_chunk_usage = getattr(chunk, "usage", None)
+                if raw_chunk_usage is not None:
+                    usage = _extract_usage(raw_chunk_usage)
 
-            message = response.choices[0].message
-            output_text = _extract_text_payload(message.content).strip()
-            if not output_text:
-                last_error = "Empty model response."
-                continue
-            usage = _extract_usage(getattr(response, "usage", None))
+                choices = getattr(chunk, "choices", None)
+                if not choices:
+                    continue
+                delta = getattr(choices[0], "delta", None)
+                content = getattr(delta, "content", None) if delta is not None else None
+                text_piece = _extract_text_payload(content)
+                if text_piece:
+                    fragments.append(text_piece)
+                    if ttft_s is None:
+                        ttft_s = now - start
+
+            total_latency_s = time.perf_counter() - start
+            output_text = "".join(fragments).strip()
+
+            if _stream_output_requires_retry(output_text):
+                stream_error = "stream output incomplete; retrying non-stream request"
+                raise RuntimeError(stream_error)
 
             completion_tokens = usage.llm_completion_tokens
             tokens_per_s = (
@@ -412,24 +425,69 @@ def _call_model_once(
                 else None
             )
 
+            if ttft_s is None:
+                ttft_s = total_latency_s
+
             return InferenceResult(
                 output_text=output_text,
-                ttft_s=total_latency_s,
+                ttft_s=ttft_s,
                 total_latency_s=total_latency_s,
                 tokens_per_s=tokens_per_s,
                 usage=usage,
             )
-        except Exception as exc:  # noqa: BLE001
-            last_error = f"{type(exc).__name__}: {exc}"
+        except Exception as stream_exc:  # noqa: BLE001
+            # Fall back to non-stream request for providers that do not support stream semantics.
+            stream_error = f"{type(stream_exc).__name__}: {stream_exc}"
+        finally:
+            close_fn = getattr(stream, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:  # noqa: BLE001
+                    pass
 
-    return InferenceResult(
-        output_text="",
-        ttft_s=None,
-        total_latency_s=time.perf_counter() - start,
-        tokens_per_s=None,
-        usage=UsageStats(),
-        error=last_error,
-    )
+        attempts = _build_request_attempts(request_base)
+        last_error = stream_error
+        for attempt in attempts:
+            try:
+                started = time.perf_counter()
+                response = _chat_create_with_retries(client=client, request_payload=attempt)
+                total_latency_s = time.perf_counter() - started
+
+                message = response.choices[0].message
+                output_text = _extract_text_payload(message.content).strip()
+                if not output_text:
+                    last_error = "Empty model response."
+                    continue
+                usage = _extract_usage(getattr(response, "usage", None))
+
+                completion_tokens = usage.llm_completion_tokens
+                tokens_per_s = (
+                    (completion_tokens / total_latency_s)
+                    if completion_tokens > 0 and total_latency_s > 0
+                    else None
+                )
+
+                return InferenceResult(
+                    output_text=output_text,
+                    ttft_s=total_latency_s,
+                    total_latency_s=total_latency_s,
+                    tokens_per_s=tokens_per_s,
+                    usage=usage,
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_error = f"{type(exc).__name__}: {exc}"
+
+        return InferenceResult(
+            output_text="",
+            ttft_s=None,
+            total_latency_s=time.perf_counter() - start,
+            tokens_per_s=None,
+            usage=UsageStats(),
+            error=last_error,
+        )
+    finally:
+        _close_client(client)
 
 
 def _filter_cases(cases: list[Any], options: RunOptions) -> list[Any]:
@@ -481,6 +539,20 @@ def _aggregate_model_summaries(case_results: list[CaseResult]) -> list[ModelSumm
 
     for model_name, rows in grouped.items():
         provider = rows[0].provider if rows else ""
+        reasoning_efforts = sorted(
+            {
+                value.strip()
+                for value in (row.reasoning_effort for row in rows)
+                if value is not None and value.strip()
+            }
+        )
+        reasoning_effort = (
+            reasoning_efforts[0]
+            if len(reasoning_efforts) == 1
+            else ", ".join(reasoning_efforts)
+            if reasoning_efforts
+            else None
+        )
 
         deterministic_values = [row.deterministic.score for row in rows if row.deterministic.score is not None]
         judge_values = [
@@ -501,6 +573,7 @@ def _aggregate_model_summaries(case_results: list[CaseResult]) -> list[ModelSumm
             ModelSummary(
                 model_name=model_name,
                 provider=provider,
+                reasoning_effort=reasoning_effort,
                 case_count=len(rows),
                 error_count=error_count,
                 deterministic_score_avg=_mean([float(v) for v in deterministic_values]),
@@ -665,6 +738,7 @@ def _model_case_worker(
     return CaseResult(
         model_name=endpoint.display_name,
         provider=endpoint.provider,
+        reasoning_effort=resolved_reasoning_effort,
         case_id=case.id,
         case_name=case.name,
         category=case.category,
@@ -718,7 +792,10 @@ def run_benchmark(config: EvalConfig, options: RunOptions) -> RunResults:
     progress_every = max(1, min(25, total_tasks // 20)) if total_tasks else 1
     started_perf = time.perf_counter()
 
-    concurrency = options.concurrency or config.concurrency
+    requested_concurrency = options.concurrency or config.concurrency
+    concurrency, concurrency_warning = _resolve_worker_concurrency(requested_concurrency)
+    if concurrency_warning is not None:
+        warnings.append(concurrency_warning)
 
     if tasks:
         if concurrency <= 1:

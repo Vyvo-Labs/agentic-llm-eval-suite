@@ -7,9 +7,11 @@ from pathlib import Path
 from llm_eval_suite.report import (
     regenerate_report_from_json,
     regenerate_reports_from_json,
+    render_detailed_report_html,
     render_history_html,
     render_leaderboard_html,
     render_leaderboard_markdown,
+    write_detailed_pdf_report,
     write_history_report,
     write_html_report,
 )
@@ -57,21 +59,21 @@ def _sample_results() -> dict[str, object]:
                 "model_name": "openrouter/qwen",
                 "final_score": 0.1,
                 "passed": False,
-                "inference": {"error": "TimeoutError"},
+                "inference": {"error": "TimeoutError", "output_text": "request timeout"},
             },
             {
                 "case_id": "case-mid",
                 "model_name": "openrouter/qwen",
                 "final_score": 0.4,
                 "passed": False,
-                "inference": {"error": None},
+                "inference": {"error": None, "output_text": "partial output"},
             },
             {
                 "case_id": "case-high",
                 "model_name": "openai/gpt-5-mini",
                 "final_score": 0.95,
                 "passed": True,
-                "inference": {"error": None},
+                "inference": {"error": None, "output_text": "best output"},
             },
         ],
         "warnings": ["Judge endpoint unavailable for one provider"],
@@ -82,6 +84,7 @@ def test_render_leaderboard_markdown_detailed_sections() -> None:
     markdown = render_leaderboard_markdown(_sample_results())
 
     assert "LLM Eval Leaderboard (r1)" in markdown
+    assert "| Rank | Model | Reasoning | Final |" in markdown
     assert markdown.index("openai/gpt-5-mini") < markdown.index("openrouter/qwen")
     assert "## Notable Failed Cases" in markdown
     assert "`case-mid` on `openrouter/qwen`" in markdown
@@ -97,7 +100,8 @@ def test_render_leaderboard_html_includes_leaderboard_pies_charts_and_explanatio
 
     assert "<h2>Leaderboard</h2>" in html_output
     assert "Click any column header to sort ascending/descending." in html_output
-    assert 'table class="sortable" data-default-sort-column="2" data-default-sort-order="desc"' in html_output
+    assert 'table class="sortable" data-default-sort-column="3" data-default-sort-order="desc"' in html_output
+    assert "<th data-sort-type=\"text\">Reasoning</th>" in html_output
     assert "Sort rows by this column" in html_output
     assert "<h2>Pie Charts</h2>" in html_output
     assert "class=\"pie-chart\"" in html_output
@@ -111,6 +115,26 @@ def test_render_leaderboard_html_includes_leaderboard_pies_charts_and_explanatio
     assert "case-low" in html_output
     assert "TimeoutError" in html_output
     assert "Judge endpoint unavailable for one provider" in html_output
+
+
+def test_render_detailed_report_html_includes_executive_failure_and_appendix_sections() -> None:
+    html_output = render_detailed_report_html(_sample_results(), include_raw_output=False)
+
+    assert "<h2>Executive Summary</h2>" in html_output
+    assert "<h2>Failure Analysis</h2>" in html_output
+    assert "<h2>Case-Level Appendix</h2>" in html_output
+    assert "Raw model outputs are omitted" in html_output
+    assert "Model Failure Breakdown" in html_output
+    assert "openrouter/qwen" in html_output
+    assert "case-low on openrouter/qwen" in html_output
+
+
+def test_render_detailed_report_html_raw_output_toggle() -> None:
+    html_output = render_detailed_report_html(_sample_results(), include_raw_output=True)
+
+    assert "Raw model outputs are included for every case." in html_output
+    assert '<pre class="output mono">best output</pre>' in html_output
+    assert "partial output" in html_output
 
 
 def test_report_regeneration_writes_markdown_and_html(tmp_path: Path) -> None:
@@ -175,6 +199,44 @@ def test_write_html_report_writes_pdf_and_png_assets_when_enabled(
     assert len(commands) == 2
     assert commands[0][1] == "pdf"
     assert commands[1][1] == "screenshot"
+
+
+def test_write_detailed_pdf_report_writes_pdf_when_renderer_available(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("llm_eval_suite.report.shutil.which", lambda binary: "/usr/bin/playwright")
+
+    commands: list[list[str]] = []
+
+    def _fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        Path(command[3]).parent.mkdir(parents=True, exist_ok=True)
+        Path(command[3]).write_text("pdf", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("llm_eval_suite.report.subprocess.run", _fake_run)
+
+    pdf_path = tmp_path / "leaderboard_detailed.pdf"
+    written = write_detailed_pdf_report(_sample_results(), pdf_path, include_raw_output=True)
+
+    assert written is True
+    assert pdf_path.exists()
+    assert len(commands) == 1
+    assert commands[0][1] == "pdf"
+
+
+def test_write_detailed_pdf_report_fail_soft_when_renderer_missing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("llm_eval_suite.report.shutil.which", lambda binary: None)
+
+    pdf_path = tmp_path / "leaderboard_detailed.pdf"
+    written = write_detailed_pdf_report(_sample_results(), pdf_path)
+
+    assert written is False
+    assert not pdf_path.exists()
 
 
 def test_write_history_report_writes_pdf_and_png_assets_when_enabled(
@@ -318,11 +380,13 @@ def test_write_history_report_splits_tied_winner_credits(tmp_path: Path) -> None
     assert "Tied Reports" in html_text
     assert "TIE (2): openrouter/model-b, openrouter/model-a" in html_text
     assert (
-        '<td class="mono sticky-col col-model">openrouter/model-a</td><td data-sort-value="2">2</td>'
+        '<td class="mono sticky-col col-model">openrouter/model-a</td><td class="mono" data-sort-value="-">-</td>'
+        '<td data-sort-value="2">2</td>'
         '<td data-sort-value="1.500000000000">1.5</td><td data-sort-value="0.750000000000">75.0%</td>'
     ) in html_text
     assert (
-        '<td class="mono sticky-col col-model">openrouter/model-b</td><td data-sort-value="2">2</td>'
+        '<td class="mono sticky-col col-model">openrouter/model-b</td><td class="mono" data-sort-value="-">-</td>'
+        '<td data-sort-value="2">2</td>'
         '<td data-sort-value="0.500000000000">0.5</td><td data-sort-value="0.250000000000">25.0%</td>'
     ) in html_text
 

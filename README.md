@@ -16,6 +16,7 @@ scores from deterministic checks plus optional LLM-judge rubric scoring.
   - `results.json`
   - `leaderboard.md`
   - `leaderboard.html`
+  - `leaderboard_detailed.pdf` (opt-in CTO-style detailed report)
   - `leaderboard_assets/leaderboard.pdf`
   - `leaderboard_assets/leaderboard.png`
   - `raw_responses.jsonl`
@@ -44,12 +45,21 @@ uv run eval-suite list-models
 # Rebuild markdown + HTML reports from prior run
 uv run eval-suite report --input reports/<run_id>/results.json
 
+# Export a detailed single-run PDF report for leadership sharing
+uv run eval-suite report --input reports/<run_id>/results.json --detailed-pdf
+
+# Generate detailed PDF during a benchmark run (optional raw outputs appendix)
+uv run eval-suite run --max-cases 10 --detailed-pdf --include-raw-output
+
 # Rebuild day-by-day dashboard across reports/
 uv run eval-suite history
 
 # Optional custom output paths
 uv run eval-suite report --input reports/<run_id>/results.json --output reports/custom.md --html-output reports/custom.html
+uv run eval-suite report --input reports/<run_id>/results.json --detailed-pdf-output reports/cto-report.pdf
 ```
+
+Detailed PDF export uses Playwright when available and fails soft: markdown/HTML artifacts are still written if PDF rendering is unavailable.
 
 ## Dataset format
 
@@ -118,6 +128,8 @@ Default OpenRouter preset models:
 - `moonshotai/kimi-k2.5`
 - `z-ai/glm-5`
 - `z-ai/glm-4.7`
+- `qwen/qwen3.5-397b-a17b`
+- `deepseek/deepseek-v3.2`
 - `anthropic/claude-haiku-4.5`
 - `anthropic/claude-sonnet-4.5`
 - `anthropic/claude-opus-4.5`
@@ -127,7 +139,7 @@ Default OpenRouter preset models:
 - `openai/gpt-4.1`
 - `openai/gpt-4.1-mini`
 - `z-ai/glm-4.7-flash`
-- `minimax/minimax-m2.5`
+- `MiniMaxAI/MiniMax-M2.5`
 - `minimax/minimax-m2-her`
 - `stepfun/step-3.5-flash`
 - `xiaomi/mimo-v2-flash`

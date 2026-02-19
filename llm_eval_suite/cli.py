@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 from .config import load_config, parse_csv_arg
 from .providers import resolve_candidate_models
-from .report import regenerate_reports_from_json, write_history_report
+from .report import regenerate_reports_from_json, write_detailed_pdf_report, write_history_report
 from .runner import RunOptions, persist_run_results, run_benchmark
 
 
@@ -40,6 +41,17 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--max-completion-tokens", type=int, help="Max completion tokens per response")
     run_parser.add_argument("--reasoning-effort", help="Override reasoning effort")
     run_parser.add_argument("--output-dir", type=Path, help="Output directory for reports")
+    run_parser.add_argument("--detailed-pdf", action="store_true", help="Export detailed run PDF report")
+    run_parser.add_argument(
+        "--detailed-pdf-output",
+        type=Path,
+        help="Optional output path for detailed PDF (default: <run-dir>/leaderboard_detailed.pdf)",
+    )
+    run_parser.add_argument(
+        "--include-raw-output",
+        action="store_true",
+        help="Include raw model outputs in detailed PDF appendix",
+    )
     run_parser.add_argument("--cache", action="store_true", help="Force-enable cache")
     run_parser.add_argument("--no-cache", action="store_true", help="Disable cache")
 
@@ -50,6 +62,17 @@ def _build_parser() -> argparse.ArgumentParser:
     report_parser.add_argument("--input", type=Path, required=True, help="Path to results.json")
     report_parser.add_argument("--output", type=Path, help="Optional markdown output path")
     report_parser.add_argument("--html-output", type=Path, help="Optional HTML output path")
+    report_parser.add_argument("--detailed-pdf", action="store_true", help="Export detailed PDF report")
+    report_parser.add_argument(
+        "--detailed-pdf-output",
+        type=Path,
+        help="Optional output path for detailed PDF (default: <input-dir>/leaderboard_detailed.pdf)",
+    )
+    report_parser.add_argument(
+        "--include-raw-output",
+        action="store_true",
+        help="Include raw model outputs in detailed PDF appendix",
+    )
 
     history_parser = subparsers.add_parser("history", help="Generate day-by-day reports dashboard HTML")
     history_parser.add_argument("--reports-dir", type=Path, help="Reports root directory (default: EVAL_OUTPUT_DIR)")
@@ -105,9 +128,27 @@ def _run_command(args: argparse.Namespace) -> int:
 
     results = run_benchmark(config, options)
     run_dir = persist_run_results(results, config.output_dir)
+    payload = results.to_dict()
+    detailed_pdf_requested = bool(args.detailed_pdf or args.detailed_pdf_output)
+    detailed_pdf_output = args.detailed_pdf_output or (run_dir / "leaderboard_detailed.pdf")
+    detailed_pdf_written = False
+    if detailed_pdf_requested:
+        detailed_pdf_written = write_detailed_pdf_report(
+            payload,
+            detailed_pdf_output,
+            include_raw_output=bool(args.include_raw_output),
+        )
 
     print(f"Benchmark run completed: {run_dir}")
     print(f"Reports: {run_dir / 'leaderboard.md'} and {run_dir / 'leaderboard.html'}")
+    if detailed_pdf_requested:
+        if detailed_pdf_written:
+            print(f"Detailed PDF report: {detailed_pdf_output}")
+        else:
+            print(
+                "warning: detailed PDF export skipped (Playwright renderer unavailable or render failed)",
+                file=sys.stderr,
+            )
     leaderboard_assets = _page_assets_dir(run_dir / "leaderboard.html")
     history_assets = _page_assets_dir(config.output_dir / "history.html")
     if leaderboard_assets.exists():
@@ -158,6 +199,23 @@ def _report_command(args: argparse.Namespace) -> int:
     assets_dir = _page_assets_dir(html_output)
     if assets_dir.exists():
         print(f"Wrote page assets: {assets_dir}")
+
+    detailed_pdf_requested = bool(args.detailed_pdf or args.detailed_pdf_output)
+    if detailed_pdf_requested:
+        payload = json.loads(args.input.read_text(encoding="utf-8"))
+        detailed_pdf_output = args.detailed_pdf_output or (args.input.parent / "leaderboard_detailed.pdf")
+        detailed_pdf_written = write_detailed_pdf_report(
+            payload,
+            detailed_pdf_output,
+            include_raw_output=bool(args.include_raw_output),
+        )
+        if detailed_pdf_written:
+            print(f"Wrote detailed PDF report: {detailed_pdf_output}")
+        else:
+            print(
+                "warning: detailed PDF export skipped (Playwright renderer unavailable or render failed)",
+                file=sys.stderr,
+            )
     return 0
 
 

@@ -4,7 +4,11 @@ from pathlib import Path
 
 from llm_eval_suite.config import EvalConfig
 from llm_eval_suite.providers import LLMEndpoint
-from llm_eval_suite.runner import _cache_request_fingerprint, _resolve_reasoning_effort_for_model
+from llm_eval_suite.runner import (
+    _cache_request_fingerprint,
+    _resolve_reasoning_effort_for_model,
+    _resolve_worker_concurrency,
+)
 
 
 def _config() -> EvalConfig:
@@ -170,3 +174,19 @@ def test_reasoning_effort_override_keeps_config_for_normal_models() -> None:
         configured_reasoning_effort="medium",
     )
     assert resolved == "medium"
+
+
+def test_resolve_worker_concurrency_caps_from_fd_soft_limit(monkeypatch) -> None:
+    monkeypatch.setattr("llm_eval_suite.runner._fd_soft_limit", lambda: 256)
+    resolved, warning = _resolve_worker_concurrency(100)
+    assert resolved == 48
+    assert warning is not None
+    assert "Capping concurrency from 100 to 48" in warning
+    assert "(256)" in warning
+
+
+def test_resolve_worker_concurrency_keeps_requested_when_limit_unknown(monkeypatch) -> None:
+    monkeypatch.setattr("llm_eval_suite.runner._fd_soft_limit", lambda: None)
+    resolved, warning = _resolve_worker_concurrency(100)
+    assert resolved == 100
+    assert warning is None

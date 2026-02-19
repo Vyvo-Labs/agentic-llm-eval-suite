@@ -6,6 +6,7 @@ import math
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +75,17 @@ def _format_count(value: float | None) -> str:
     return text
 
 
+def _normalize_reasoning_effort(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _format_reasoning_effort(value: Any) -> str:
+    return _normalize_reasoning_effort(value) or "-"
+
+
 def _winner_model_names(model_summaries: list[dict[str, Any]]) -> tuple[list[str], float | None]:
     scored_rows: list[tuple[str, float]] = []
     for summary in model_summaries:
@@ -119,55 +131,63 @@ def _page_assets_dir_for_html(output_path: Path) -> Path:
     return output_path.parent / f"{output_path.stem}_assets"
 
 
+def _export_html_to_pdf(html_output_path: Path, pdf_output_path: Path) -> bool:
+    playwright_command = _resolve_playwright_command()
+    if not playwright_command:
+        return False
+
+    pdf_output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        *playwright_command,
+        "pdf",
+        html_output_path.resolve().as_uri(),
+        str(pdf_output_path),
+        "--paper-format",
+        "A4",
+        "--wait-for-timeout",
+        "1200",
+    ]
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return False
+    return pdf_output_path.exists()
+
+
 def _export_page_assets(html_output_path: Path) -> None:
     if not _is_page_asset_export_enabled():
         return
 
-    playwright_command = _resolve_playwright_command()
-    if not playwright_command:
+    if not _resolve_playwright_command():
         return
 
     assets_dir = _page_assets_dir_for_html(html_output_path)
     assets_dir.mkdir(parents=True, exist_ok=True)
-    page_uri = html_output_path.resolve().as_uri()
+    pdf_target = assets_dir / f"{html_output_path.stem}.pdf"
 
-    commands = [
-        (
-            assets_dir / f"{html_output_path.stem}.pdf",
-            [
-                *playwright_command,
-                "pdf",
-                page_uri,
-                str(assets_dir / f"{html_output_path.stem}.pdf"),
-                "--paper-format",
-                "A4",
-                "--wait-for-timeout",
-                "1200",
-            ],
-        ),
-        (
-            assets_dir / f"{html_output_path.stem}.png",
-            [
-                *playwright_command,
-                "screenshot",
-                page_uri,
-                str(assets_dir / f"{html_output_path.stem}.png"),
-                "--full-page",
-                "--wait-for-timeout",
-                "1200",
-            ],
-        ),
-    ]
+    rendered_any = _export_html_to_pdf(html_output_path, pdf_target)
 
-    rendered_any = False
-    for target, command in commands:
+    playwright_command = _resolve_playwright_command()
+    if playwright_command:
+        png_target = assets_dir / f"{html_output_path.stem}.png"
+        page_uri = html_output_path.resolve().as_uri()
+        command = [
+            *playwright_command,
+            "screenshot",
+            page_uri,
+            str(png_target),
+            "--full-page",
+            "--wait-for-timeout",
+            "1200",
+        ]
         try:
             subprocess.run(command, check=True, capture_output=True, text=True)
         except (FileNotFoundError, subprocess.CalledProcessError):
             # Rendering is best-effort and should not block report generation.
-            continue
-        if target.exists():
-            rendered_any = True
+            pass
+        else:
+            if png_target.exists():
+                rendered_any = True
 
     if not rendered_any:
         try:
@@ -270,6 +290,7 @@ def _load_history_entries(reports_root: Path) -> list[dict[str, Any]]:
                 {
                     "model_name": model_name,
                     "provider": _infer_provider_label(summary),
+                    "reasoning_effort": _normalize_reasoning_effort(summary.get("reasoning_effort")),
                     "final_score_avg": _as_float(summary.get("final_score_avg")),
                     "pass_rate": _as_float(summary.get("pass_rate")),
                     "deterministic_score_avg": _as_float(summary.get("deterministic_score_avg")),
@@ -386,6 +407,7 @@ def _build_history_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
                     "reports_seen": 0,
                     "win_credits": 0.0,
                     "outright_wins": 0,
+                    "reasoning_efforts": set(),
                     "final_scores": [],
                     "pass_rates": [],
                     "deterministic_scores": [],
@@ -410,6 +432,7 @@ def _build_history_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
             ttft_p50 = _as_float(summary.get("ttft_p50_s"))
             tokens_per_s_p50 = _as_float(summary.get("tokens_per_s_p50"))
             error_count = _as_float(summary.get("error_count"))
+            reasoning_effort = _normalize_reasoning_effort(summary.get("reasoning_effort"))
 
             if final_score is not None:
                 state["final_scores"].append(final_score)
@@ -427,6 +450,8 @@ def _build_history_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
                 state["tokens_per_s_p50_values"].append(tokens_per_s_p50)
             if error_count is not None:
                 state["error_total"] += int(error_count)
+            if reasoning_effort is not None:
+                state["reasoning_efforts"].add(reasoning_effort)
 
     historical_leaderboard_rows: list[dict[str, Any]] = []
     for state in historical_by_model.values():
@@ -435,6 +460,7 @@ def _build_history_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
         outright_wins = int(state["outright_wins"])
         tie_win_credits = max(0.0, wins - float(outright_wins))
         final_scores = [float(item) for item in state["final_scores"]]
+        reasoning_efforts = sorted(str(item) for item in state["reasoning_efforts"])
         total_final_score = sum(final_scores)
         historical_leaderboard_rows.append(
             {
@@ -443,6 +469,13 @@ def _build_history_metrics(entries: list[dict[str, Any]]) -> dict[str, Any]:
                 "wins": wins,
                 "outright_wins": outright_wins,
                 "tie_win_credits": tie_win_credits,
+                "reasoning_effort": (
+                    reasoning_efforts[0]
+                    if len(reasoning_efforts) == 1
+                    else ", ".join(reasoning_efforts)
+                    if reasoning_efforts
+                    else None
+                ),
                 "win_rate_global": (wins / report_count) if report_count else None,
                 "win_rate_seen": (wins / reports_seen) if reports_seen else None,
                 "total_final_score": total_final_score,
@@ -825,9 +858,10 @@ def render_history_html(reports_root: Path) -> str:
         lines.extend(
             [
                 '<div class="table-wrap">',
-                '<table class="sortable" data-default-sort-column="5" data-default-sort-order="desc">',
+                '<table class="sortable" data-default-sort-column="6" data-default-sort-order="desc">',
                 "<thead><tr>"
                 '<th class="col-rank" data-sort-type="number">Rank</th><th class="sticky-col col-model" data-sort-type="text">Model</th>'
+                '<th data-sort-type="text">Reasoning</th>'
                 '<th data-sort-type="number">Reports</th><th data-sort-type="number">Win Credits</th><th data-sort-type="percent">Global Win Rate (credits/report_count)</th>'
                 '<th data-sort-type="number">Mean Final</th><th data-sort-type="number">Median Final</th><th data-sort-type="percent">Mean Pass Rate</th><th data-sort-type="number">Mean Deterministic</th>'
                 '<th data-sort-type="number">Mean Judge</th><th data-sort-type="number">Mean Latency p50</th><th data-sort-type="number">Mean TTFT p50</th>'
@@ -849,10 +883,12 @@ def render_history_html(reports_root: Path) -> str:
             mean_ttft_p50_s = _as_float(row.get("mean_ttft_p50_s"))
             mean_tokens_per_s_p50 = _as_float(row.get("mean_tokens_per_s_p50"))
             mean_error_count = _as_float(row.get("mean_error_count"))
+            reasoning_effort = _format_reasoning_effort(row.get("reasoning_effort"))
             lines.append(
                 "<tr>"
                 f'<td class="col-rank" data-sort-value="{rank}">{rank}</td>'
                 f'<td class="mono sticky-col col-model">{html.escape(str(row.get("model_name", "-")))}</td>'
+                f'<td class="mono" data-sort-value="{html.escape(reasoning_effort)}">{html.escape(reasoning_effort)}</td>'
                 f'<td data-sort-value="{reports_seen}">{reports_seen}</td>'
                 f'<td data-sort-value="{_sort_value(wins)}">{_format_count(wins)}</td>'
                 f'<td data-sort-value="{_sort_value(win_rate_global)}">{_format_pct(win_rate_global)}</td>'
@@ -1100,10 +1136,10 @@ def render_leaderboard_markdown(results: dict[str, Any]) -> str:
         return "\n".join(lines)
 
     lines.append(
-        "| Rank | Model | Final | Deterministic | Judge | Pass Rate | "
+        "| Rank | Model | Reasoning | Final | Deterministic | Judge | Pass Rate | "
         "TTFT p50/p95 (s) | Latency p50/p95 (s) | Tokens/s p50/p95 | Errors |"
     )
-    lines.append("|---:|---|---:|---:|---:|---:|---|---|---|---:|")
+    lines.append("|---:|---|---|---:|---:|---:|---:|---|---|---|---:|")
 
     for index, summary in enumerate(model_summaries, start=1):
         lines.append(
@@ -1111,6 +1147,8 @@ def render_leaderboard_markdown(results: dict[str, Any]) -> str:
             f"{index}"
             " | "
             f"`{summary.get('model_name', '-')}`"
+            " | "
+            f"{_format_reasoning_effort(summary.get('reasoning_effort'))}"
             " | "
             f"{_format_num(summary.get('final_score_avg'))}"
             " | "
@@ -1330,10 +1368,10 @@ def render_leaderboard_html(results: dict[str, Any]) -> str:
         lines.extend(
             [
                 '<p class="muted">Click any column header to sort ascending/descending.</p>',
-                '<table class="sortable" data-default-sort-column="2" data-default-sort-order="desc">',
+                '<table class="sortable" data-default-sort-column="3" data-default-sort-order="desc">',
                 "<thead><tr>"
                 '<th class="col-rank" data-sort-type="number">Rank</th><th data-sort-type="text">Model</th>'
-                '<th data-sort-type="number">Final</th><th data-sort-type="number">Deterministic</th><th data-sort-type="number">Judge</th>'
+                '<th data-sort-type="text">Reasoning</th><th data-sort-type="number">Final</th><th data-sort-type="number">Deterministic</th><th data-sort-type="number">Judge</th>'
                 '<th data-sort-type="percent">Pass Rate</th><th data-sort-type="number">TTFT p50/p95</th><th data-sort-type="number">Latency p50/p95</th>'
                 '<th data-sort-type="number">Tokens/s p50/p95</th><th data-sort-type="number">Errors</th>'
                 "</tr></thead>",
@@ -1353,10 +1391,12 @@ def render_leaderboard_html(results: dict[str, Any]) -> str:
             tokens_per_s_p50 = _as_float(summary.get("tokens_per_s_p50"))
             tokens_per_s_p95 = _as_float(summary.get("tokens_per_s_p95"))
             error_count = int(_as_float(summary.get("error_count")) or 0)
+            reasoning_effort = _format_reasoning_effort(summary.get("reasoning_effort"))
             lines.append(
                 "<tr>"
                 f'<td class="col-rank" data-sort-value="{rank}">{rank}</td>'
                 f'<td class="mono">{html.escape(str(summary.get("model_name", "-")))}</td>'
+                f'<td class="mono" data-sort-value="{html.escape(reasoning_effort)}">{html.escape(reasoning_effort)}</td>'
                 f'<td data-sort-value="{_sort_value(final_score)}">{_format_num(final_score)}</td>'
                 f'<td data-sort-value="{_sort_value(deterministic_score)}">{_format_num(deterministic_score)}</td>'
                 f'<td data-sort-value="{_sort_value(judge_score)}">{_format_num(judge_score)}</td>'
@@ -1438,6 +1478,7 @@ def render_leaderboard_html(results: dict[str, Any]) -> str:
             "<li><strong>Final</strong>: weighted combination of deterministic checks and judge score.</li>",
             "<li><strong>Deterministic</strong>: exact/regex/include/json checks against expected output.</li>",
             "<li><strong>Judge</strong>: optional rubric-based LLM scoring when enabled for a case.</li>",
+            "<li><strong>Reasoning</strong>: resolved reasoning effort applied to each model request (if set).</li>",
             "<li><strong>Pass rate</strong>: fraction of cases with final score at or above the suite threshold.</li>",
             "<li><strong>TTFT / Latency / Tokens per second</strong>: response performance distribution metrics.</li>",
             "</ul>",
@@ -1500,6 +1541,313 @@ def render_leaderboard_html(results: dict[str, Any]) -> str:
     lines.extend(_render_sortable_tables_script_lines())
     lines.extend(["</main>", "</body>", "</html>"])
     return "\n".join(lines)
+
+
+def render_detailed_report_html(results: dict[str, Any], include_raw_output: bool = False) -> str:
+    run_id = str(results.get("run_id", "unknown"))
+    started_at = str(results.get("started_at", "unknown"))
+    finished_at = str(results.get("finished_at", "unknown"))
+    datasets = [str(item) for item in results.get("datasets", [])]
+    dataset_text = ", ".join(datasets) if datasets else "-"
+
+    model_summaries = _sorted_model_summaries(results)
+    case_results = list(results.get("case_results", []))
+    warnings = [str(item) for item in results.get("warnings", [])]
+    quality_failures, execution_errors = _split_failed_cases(results)
+    winner_models, winner_score = _winner_model_names(model_summaries)
+    winner_label = _winner_label(winner_models)
+
+    total_cases = len(case_results)
+    pass_count = sum(1 for case in case_results if bool(case.get("passed")))
+    fail_count = max(0, total_cases - pass_count)
+    pass_rate = (pass_count / total_cases) if total_cases else None
+    execution_error_count = len(execution_errors)
+
+    model_failure_rows: list[tuple[str, int, int]] = []
+    failure_by_model: dict[str, dict[str, int]] = {}
+    for case in case_results:
+        model_name = str(case.get("model_name", "-"))
+        bucket = failure_by_model.setdefault(model_name, {"failed": 0, "errors": 0})
+        if not bool(case.get("passed")):
+            bucket["failed"] += 1
+            if _case_error_text(case):
+                bucket["errors"] += 1
+    for model_name, counts in failure_by_model.items():
+        model_failure_rows.append((model_name, counts["failed"], counts["errors"]))
+    model_failure_rows.sort(key=lambda row: (row[1], row[2], row[0]), reverse=True)
+
+    ordered_cases = sorted(
+        case_results,
+        key=lambda item: (
+            bool(item.get("passed")),
+            _as_float(item.get("final_score")) if _as_float(item.get("final_score")) is not None else 1.0,
+            str(item.get("case_id", "")),
+            str(item.get("model_name", "")),
+        ),
+    )
+
+    lines: list[str] = [
+        "<!doctype html>",
+        '<html lang="en">',
+        "<head>",
+        '<meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        f"<title>LLM Eval Detailed Report {html.escape(run_id)}</title>",
+        "<style>",
+        ":root { color-scheme: light; }",
+        "body { margin: 0; font-family: 'Avenir Next', Avenir, 'Segoe UI', sans-serif; background: #f5f7fb; color: #1f2937; }",
+        ".page { max-width: 1150px; margin: 0 auto; padding: 22px; }",
+        ".hero { background: linear-gradient(120deg, #0f172a, #1d4ed8); color: #f8fafc; border-radius: 16px; padding: 22px; box-shadow: 0 10px 28px rgba(15, 23, 42, 0.2); }",
+        ".hero h1 { margin: 0; font-size: 1.9rem; }",
+        ".hero p { margin: 8px 0 0; opacity: 0.92; }",
+        ".meta-grid { margin-top: 14px; display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }",
+        ".meta-card { background: rgba(255,255,255,0.14); border: 1px solid rgba(255,255,255,0.2); border-radius: 11px; padding: 9px 11px; }",
+        ".section { margin-top: 18px; background: #ffffff; border-radius: 12px; border: 1px solid #e5e7eb; padding: 16px; }",
+        "h2 { margin: 0 0 10px 0; font-size: 1.2rem; }",
+        "h3 { margin: 0 0 8px 0; font-size: 1.02rem; }",
+        ".muted { margin: 0 0 8px 0; color: #6b7280; }",
+        ".mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }",
+        ".kpi-grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }",
+        ".kpi { background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 10px; padding: 10px; }",
+        ".kpi strong { display: block; margin-bottom: 4px; }",
+        ".table-wrap { overflow-x: auto; border: 1px solid #e5e7eb; border-radius: 10px; }",
+        "table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }",
+        "th, td { border-bottom: 1px solid #e5e7eb; text-align: left; padding: 8px; vertical-align: top; }",
+        "th { background: #f8fafc; }",
+        ".case-card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 11px; margin-bottom: 10px; background: #fcfdff; }",
+        ".case-meta { margin: 0 0 8px 0; font-size: 0.88rem; color: #374151; }",
+        ".case-error { color: #b91c1c; }",
+        ".output { margin: 0; padding: 9px; border-radius: 8px; border: 1px solid #d1d5db; background: #0f172a; color: #e5e7eb; white-space: pre-wrap; word-break: break-word; font-size: 0.82rem; }",
+        ".page-break { break-before: page; page-break-before: always; }",
+        "@media print { body { background: #fff; } .page { max-width: none; padding: 12mm; } .section { box-shadow: none; } }",
+        "</style>",
+        "</head>",
+        "<body>",
+        '<main class="page">',
+        '<section class="hero">',
+        f"<h1>LLM Eval Detailed Report ({html.escape(run_id)})</h1>",
+        "<p>Executive summary plus technical appendix for leadership review.</p>",
+        '<div class="meta-grid">',
+        f'<div class="meta-card"><strong>Started</strong><div class="mono">{html.escape(started_at)}</div></div>',
+        f'<div class="meta-card"><strong>Finished</strong><div class="mono">{html.escape(finished_at)}</div></div>',
+        f'<div class="meta-card"><strong>Datasets</strong><div class="mono">{html.escape(dataset_text)}</div></div>',
+        f'<div class="meta-card"><strong>Winner</strong><div class="mono">{html.escape(winner_label)} ({html.escape(_format_num(winner_score))})</div></div>',
+        "</div>",
+        "</section>",
+        '<section class="section">',
+        "<h2>Executive Summary</h2>",
+        "<p class=\"muted\">Primary decision metrics for this benchmark run.</p>",
+        '<div class="kpi-grid">',
+        f'<div class="kpi"><strong>Model Count</strong><div class="mono">{len(model_summaries)}</div></div>',
+        f'<div class="kpi"><strong>Case Count</strong><div class="mono">{total_cases}</div></div>',
+        f'<div class="kpi"><strong>Pass Rate</strong><div class="mono">{html.escape(_format_pct(pass_rate))}</div></div>',
+        f'<div class="kpi"><strong>Failed Cases</strong><div class="mono">{fail_count}</div></div>',
+        f'<div class="kpi"><strong>Execution Errors</strong><div class="mono">{execution_error_count}</div></div>',
+        f'<div class="kpi"><strong>Warnings</strong><div class="mono">{len(warnings)}</div></div>',
+        "</div>",
+        "</section>",
+        '<section class="section">',
+        "<h2>Leaderboard</h2>",
+        "<p class=\"muted\">Model ranking by final score with quality and performance metrics.</p>",
+    ]
+
+    if not model_summaries:
+        lines.append('<p class="muted">No model results were generated.</p>')
+    else:
+        lines.extend(
+            [
+                '<div class="table-wrap">',
+                "<table>",
+                "<thead><tr>"
+                "<th>Rank</th><th>Model</th><th>Reasoning</th><th>Final</th><th>Deterministic</th><th>Judge</th>"
+                "<th>Pass Rate</th><th>TTFT p50/p95</th><th>Latency p50/p95</th><th>Tokens/s p50/p95</th><th>Errors</th>"
+                "</tr></thead>",
+                "<tbody>",
+            ]
+        )
+        for rank, summary in enumerate(model_summaries, start=1):
+            lines.append(
+                "<tr>"
+                f"<td>{rank}</td>"
+                f'<td class="mono">{html.escape(str(summary.get("model_name", "-")))}</td>'
+                f'<td class="mono">{html.escape(_format_reasoning_effort(summary.get("reasoning_effort")))}</td>'
+                f"<td>{html.escape(_format_num(_as_float(summary.get('final_score_avg'))))}</td>"
+                f"<td>{html.escape(_format_num(_as_float(summary.get('deterministic_score_avg'))))}</td>"
+                f"<td>{html.escape(_format_num(_as_float(summary.get('judge_score_avg'))))}</td>"
+                f"<td>{html.escape(_format_pct(_as_float(summary.get('pass_rate'))))}</td>"
+                f"<td>{html.escape(_format_num(_as_float(summary.get('ttft_p50_s'))))}/"
+                f"{html.escape(_format_num(_as_float(summary.get('ttft_p95_s'))))}</td>"
+                f"<td>{html.escape(_format_num(_as_float(summary.get('latency_p50_s'))))}/"
+                f"{html.escape(_format_num(_as_float(summary.get('latency_p95_s'))))}</td>"
+                f"<td>{html.escape(_format_num(_as_float(summary.get('tokens_per_s_p50'))))}/"
+                f"{html.escape(_format_num(_as_float(summary.get('tokens_per_s_p95'))))}</td>"
+                f"<td>{html.escape(_format_count(_as_float(summary.get('error_count'))))}</td>"
+                "</tr>"
+            )
+        lines.extend(["</tbody>", "</table>", "</div>"])
+
+    lines.extend(
+        [
+            "</section>",
+            '<section class="section page-break">',
+            "<h2>Failure Analysis</h2>",
+            "<p class=\"muted\">Highest-risk misses and transport/provider errors.</p>",
+            "<h3>Model Failure Breakdown</h3>",
+        ]
+    )
+
+    if model_failure_rows:
+        lines.extend(
+            [
+                '<div class="table-wrap">',
+                "<table>",
+                "<thead><tr><th>Model</th><th>Failed Cases</th><th>Execution Errors</th></tr></thead>",
+                "<tbody>",
+            ]
+        )
+        for model_name, failed_count, error_count in model_failure_rows:
+            lines.append(
+                "<tr>"
+                f'<td class="mono">{html.escape(model_name)}</td>'
+                f"<td>{failed_count}</td>"
+                f"<td>{error_count}</td>"
+                "</tr>"
+            )
+        lines.extend(["</tbody>", "</table>", "</div>"])
+    else:
+        lines.append('<p class="muted">No failures detected.</p>')
+
+    lines.extend(["<h3>Notable Failed Cases</h3>"])
+    if quality_failures:
+        lines.extend(["<ul>"])
+        for case in quality_failures[:20]:
+            lines.append(
+                "<li class=\"mono\">"
+                f"{html.escape(str(case.get('case_id', '-')))} on "
+                f"{html.escape(str(case.get('model_name', '-')))} | "
+                f"score={html.escape(_format_num(_as_float(case.get('final_score'))))}"
+                "</li>"
+            )
+        lines.append("</ul>")
+    else:
+        lines.append('<p class="muted">No quality-only failed cases.</p>')
+
+    lines.extend(["<h3>Execution Errors</h3>"])
+    if execution_errors:
+        lines.extend(["<ul>"])
+        for case in execution_errors[:20]:
+            lines.append(
+                "<li class=\"mono\">"
+                f"{html.escape(str(case.get('case_id', '-')))} on "
+                f"{html.escape(str(case.get('model_name', '-')))} | "
+                f"score={html.escape(_format_num(_as_float(case.get('final_score'))))} | "
+                f"error={html.escape(str(_case_error_text(case) or '-'))}"
+                "</li>"
+            )
+        lines.append("</ul>")
+    else:
+        lines.append('<p class="muted">No execution errors detected.</p>')
+    lines.append("</section>")
+
+    lines.extend(
+        [
+            '<section class="section page-break">',
+            "<h2>Case-Level Appendix</h2>",
+            "<p class=\"muted\">Full case outcomes across all evaluated model-case pairs.</p>",
+        ]
+    )
+    if include_raw_output:
+        lines.append('<p class="muted">Raw model outputs are included for every case.</p>')
+    else:
+        lines.append('<p class="muted">Raw model outputs are omitted (enable via `--include-raw-output`).</p>')
+
+    if not ordered_cases:
+        lines.append('<p class="muted">No case-level rows available.</p>')
+    else:
+        for case in ordered_cases:
+            inference = case.get("inference", {})
+            if not isinstance(inference, dict):
+                inference = {}
+            judge = case.get("judge")
+            judge_flags_text = "-"
+            if isinstance(judge, dict):
+                raw_flags = judge.get("flags")
+                if isinstance(raw_flags, list) and raw_flags:
+                    judge_flags_text = ", ".join(str(item) for item in raw_flags)
+
+            lines.extend(
+                [
+                    '<article class="case-card">',
+                    f"<h3>{html.escape(str(case.get('case_id', '-')))} "
+                    f"on {html.escape(str(case.get('model_name', '-')))}</h3>",
+                    (
+                        '<p class="case-meta">'
+                        f"Name: {html.escape(str(case.get('case_name', '-')))} | "
+                        f"Category: {html.escape(str(case.get('category', '-')))} | "
+                        f"Tags: {html.escape(', '.join(str(item) for item in case.get('tags', []) or [])) or '-'} | "
+                        f"Final: {html.escape(_format_num(_as_float(case.get('final_score'))))} | "
+                        f"Passed: {html.escape(str(bool(case.get('passed'))))} | "
+                        f"Judge Flags: {html.escape(judge_flags_text)}"
+                        "</p>"
+                    ),
+                ]
+            )
+
+            error_text = _case_error_text(case)
+            if error_text:
+                lines.append(f'<p class="case-meta case-error mono">Error: {html.escape(error_text)}</p>')
+
+            if include_raw_output:
+                lines.append(f'<pre class="output mono">{html.escape(str(inference.get("output_text", "")))}</pre>')
+
+            lines.append("</article>")
+
+    if warnings:
+        lines.extend(
+            [
+                '<section class="section page-break">',
+                "<h2>Warnings</h2>",
+                "<ul>",
+            ]
+        )
+        for warning in warnings:
+            lines.append(f"<li>{html.escape(warning)}</li>")
+        lines.extend(["</ul>", "</section>"])
+
+    lines.extend(["</main>", "</body>", "</html>"])
+    return "\n".join(lines)
+
+
+def write_detailed_pdf_report(
+    results: dict[str, Any],
+    output_path: Path,
+    *,
+    include_raw_output: bool = False,
+) -> bool:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    html_content = render_detailed_report_html(results, include_raw_output=include_raw_output)
+
+    temp_html_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".html",
+            prefix="llm_eval_detail_",
+            encoding="utf-8",
+            delete=False,
+        ) as handle:
+            handle.write(html_content)
+            temp_html_path = Path(handle.name)
+
+        if temp_html_path is None:
+            return False
+        return _export_html_to_pdf(temp_html_path, output_path)
+    finally:
+        if temp_html_path is not None:
+            try:
+                temp_html_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def write_markdown_report(results: dict[str, Any], output_path: Path) -> None:

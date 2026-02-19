@@ -112,6 +112,7 @@ class JudgeScore:
 class CaseResult:
     model_name: str
     provider: str
+    reasoning_effort: str | None
     case_id: str
     case_name: str
     category: str
@@ -127,6 +128,7 @@ class CaseResult:
 class ModelSummary:
     model_name: str
     provider: str
+    reasoning_effort: str | None
     case_count: int
     error_count: int
     deterministic_score_avg: float | None
