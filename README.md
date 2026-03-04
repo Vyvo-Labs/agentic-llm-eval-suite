@@ -103,7 +103,7 @@ cases:
 ### Candidate matrix
 
 - `EVAL_PROVIDER_PRESET` (`all` or comma list of providers, default: `openrouter`)
-- `EVAL_MAX_MODELS_PER_PROVIDER` (default: `20`)
+- `EVAL_MAX_MODELS_PER_PROVIDER` (default: `30`)
 - `EVAL_PRESET_MODELS_OPENAI` (optional comma list override)
 - `EVAL_PRESET_MODELS_GROQ`
 - `EVAL_PRESET_MODELS_OPENROUTER`
@@ -136,12 +136,16 @@ Default OpenRouter preset models:
 - `moonshotai/kimi-k2.5`
 - `z-ai/glm-5`
 - `z-ai/glm-4.7`
+- `google/gemini-3.1-flash-lite-preview`
 - `qwen/qwen3.5-397b-a17b`
+- `qwen/qwen3.5-35b-a3b`
+- `qwen/qwen3.5-27b`
 - `deepseek/deepseek-v3.2`
 - `anthropic/claude-haiku-4.5`
 - `anthropic/claude-sonnet-4.5`
 - `anthropic/claude-opus-4.5`
 - `openai/gpt-5-mini/minimal`
+- `openai/gpt-5.3-chat`
 - `openai/gpt-5.2`
 - `openai/gpt-5.2/none`
 - `openai/gpt-4.1`

@@ -127,7 +127,7 @@ def test_explicit_eval_preset_models_override_legacy_alias(
     assert config.preset_models["openrouter"] == ["anthropic/claude-opus-4.5"]
 
 
-def test_load_config_defaults_to_all_models_per_provider_limit_of_20(
+def test_load_config_defaults_to_all_models_per_provider_limit_of_30(
     monkeypatch: object,
     tmp_path: Path,
 ) -> None:
@@ -136,7 +136,7 @@ def test_load_config_defaults_to_all_models_per_provider_limit_of_20(
     dotenv_path.write_text("", encoding="utf-8")
 
     config = load_config(dotenv_path)
-    assert config.max_models_per_provider == 20
+    assert config.max_models_per_provider == 30
 
 
 def test_load_config_defaults_judge_to_gpt_5_2_xhigh(
