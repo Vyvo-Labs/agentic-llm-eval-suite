@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Any, Iterable
 
 from .config import EvalConfig, PROVIDERS
 
@@ -39,6 +39,8 @@ _REASONING_EFFORT_TAGS: set[str] = {
     "xhigh",
 }
 
+_NON_THINKING_QWEN_MODEL_SUFFIX = "qwen/qwen3.5-27b"
+
 _DEFAULT_PRESET_MODELS: dict[str, list[str]] = {
     "openai": [
         "gpt-5-mini",
@@ -46,39 +48,40 @@ _DEFAULT_PRESET_MODELS: dict[str, list[str]] = {
         "gpt-5.2",
         "gpt-5-mini/minimal",
         "gpt-5.2/none",
+        "Qwen/Qwen3.5-27B",
     ],
     "groq": ["llama-3.3-70b-versatile", "mixtral-8x7b-32768"],
     # OpenRouter defaults bias toward current open models.
     "openrouter": [
-        "moonshotai/kimi-k2.5",
         "z-ai/glm-5",
-        "z-ai/glm-4.7",
         "google/gemini-3.1-flash-lite-preview",
-        "qwen/qwen3.5-397b-a17b",
         "qwen/qwen3.5-35b-a3b",
-        "qwen/qwen3.5-27b",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "Qwen/Qwen3.5-27B",
         "deepseek/deepseek-v3.2",
         "anthropic/claude-haiku-4.5",
-        "anthropic/claude-sonnet-4.5",
-        "anthropic/claude-opus-4.5",
         "openai/gpt-5-mini/minimal",
         "openai/gpt-5.3-chat",
         "openai/gpt-5.2",
         "openai/gpt-5.2/none",
-        "openai/gpt-4.1",
         "openai/gpt-4.1-mini",
-        "z-ai/glm-4.7-flash",
-        "MiniMaxAI/MiniMax-M2.5",
-        "minimax/minimax-m2-her",
-        "stepfun/step-3.5-flash",
-        "xiaomi/mimo-v2-flash",
-        "nvidia/nemotron-3-nano-30b-a3b",
-        "meituan/longcat-flash-chat",
     ],
     "fireworks": ["accounts/fireworks/models/llama-v3p1-8b-instruct"],
     "together": ["meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo"],
     "cerebras": ["llama3.1-8b"],
 }
+
+
+def _normalize_openai_base_url(base_url: str | None) -> str | None:
+    raw = (base_url or "").strip().rstrip("/")
+    if not raw:
+        return None
+
+    suffix = "/chat/completions"
+    if raw.lower().endswith(suffix):
+        raw = raw[: -len(suffix)].rstrip("/")
+
+    return raw or None
 
 
 @dataclass(slots=True)
@@ -143,10 +146,20 @@ def normalize_llm_model_for_provider(provider: str, model: str) -> str:
     return normalized_model
 
 
+def extra_body_for_model(model: str) -> dict[str, Any] | None:
+    normalized = (model or "").strip().lower()
+    if not normalized:
+        return None
+    model_tail = "/".join(normalized.split("/")[-2:])
+    if model_tail == _NON_THINKING_QWEN_MODEL_SUFFIX:
+        # Qwen 3.5 SGLang non-thinking mode (OpenAI-compatible extra body).
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+    return None
+
+
 def _provider_base_url(provider: str, env: dict[str, str]) -> str | None:
     if provider == "openai":
-        raw = (env.get("OPENAI_BASE_URL") or "").strip()
-        return raw or None
+        return _normalize_openai_base_url(env.get("OPENAI_BASE_URL"))
     return _PROVIDER_BASE_URLS[provider]
 
 
@@ -235,7 +248,7 @@ def resolve_judge_endpoint(config: EvalConfig) -> tuple[LLMEndpoint | None, str 
         )
 
     if provider == "openai":
-        base_url = (config.judge_base_url or "").strip() or (config.env.get("OPENAI_BASE_URL") or "").strip() or None
+        base_url = _normalize_openai_base_url(config.judge_base_url or config.env.get("OPENAI_BASE_URL"))
     else:
         base_url = _PROVIDER_BASE_URLS[provider]
 

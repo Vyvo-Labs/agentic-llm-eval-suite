@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import threading
 import time
@@ -28,6 +29,7 @@ from .models import (
 from .providers import (
     LLMEndpoint,
     ResolvedModels,
+    extra_body_for_model,
     resolve_candidate_models,
     resolve_judge_endpoint,
     split_model_reasoning_tag,
@@ -56,6 +58,9 @@ _TRANSIENT_ERROR_HINTS: tuple[str, ...] = (
 )
 _REQUEST_RETRY_ATTEMPTS = 3
 _REQUEST_RETRY_BASE_BACKOFF_S = 0.6
+_RATE_LIMIT_RESET_BUFFER_S = 0.25
+_RATE_LIMIT_RESET_MAX_SLEEP_S = 65.0
+_EMPTY_RESPONSE_RETRY_ATTEMPTS = 2
 _FD_RESERVE = 64
 _FD_BUDGET_PER_WORKER = 4
 
@@ -225,6 +230,32 @@ def _extract_text_payload(content: Any) -> str:
     return str(content)
 
 
+def _extract_message_output_text(message: Any) -> str:
+    content_text = _extract_text_payload(getattr(message, "content", None)).strip()
+    if content_text:
+        return content_text
+
+    refusal_text = _extract_text_payload(getattr(message, "refusal", None)).strip()
+    if refusal_text:
+        return refusal_text
+
+    return ""
+
+
+def _merge_extra_body(
+    base: dict[str, Any] | None,
+    patch: dict[str, Any],
+) -> dict[str, Any]:
+    merged: dict[str, Any] = dict(base or {})
+    for key, value in patch.items():
+        existing = merged.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            merged[key] = {**existing, **value}
+        else:
+            merged[key] = value
+    return merged
+
+
 def _build_request_attempts(base: dict[str, Any]) -> list[dict[str, Any]]:
     attempts: list[dict[str, Any]] = [dict(base)]
 
@@ -233,27 +264,26 @@ def _build_request_attempts(base: dict[str, Any]) -> list[dict[str, Any]]:
         no_reasoning.pop("reasoning_effort", None)
         attempts.append(no_reasoning)
 
-    if "max_completion_tokens" in base:
-        legacy = dict(base)
+    token_seed_attempts = list(attempts)
+    for seed in token_seed_attempts:
+        if "max_completion_tokens" not in seed:
+            continue
+
+        legacy = dict(seed)
         max_tokens_value = legacy.pop("max_completion_tokens")
         legacy["max_tokens"] = max_tokens_value
         attempts.append(legacy)
 
-        if "reasoning_effort" in legacy:
-            legacy_no_reasoning = dict(legacy)
-            legacy_no_reasoning.pop("reasoning_effort", None)
-            attempts.append(legacy_no_reasoning)
+        boosted_tokens = dict(legacy)
+        boosted_value = boosted_tokens.get("max_tokens")
+        if isinstance(boosted_value, int) and boosted_value > 0:
+            boosted_tokens["max_tokens"] = min(max(boosted_value * 2, 1024), 2048)
+            attempts.append(boosted_tokens)
 
-            boosted_tokens = dict(legacy_no_reasoning)
-            boosted_value = boosted_tokens.get("max_tokens")
-            if isinstance(boosted_value, int) and boosted_value > 0:
-                boosted_tokens["max_tokens"] = min(max(boosted_value * 2, 1024), 2048)
-                attempts.append(boosted_tokens)
-
-                if boosted_tokens["max_tokens"] < 2048:
-                    boosted_tokens_max = dict(boosted_tokens)
-                    boosted_tokens_max["max_tokens"] = 2048
-                    attempts.append(boosted_tokens_max)
+            if boosted_tokens["max_tokens"] < 2048:
+                boosted_tokens_max = dict(boosted_tokens)
+                boosted_tokens_max["max_tokens"] = 2048
+                attempts.append(boosted_tokens_max)
 
     deduped: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -281,6 +311,140 @@ def _is_transient_request_error(exc: Exception) -> bool:
     return any(hint in text for hint in _TRANSIENT_ERROR_HINTS)
 
 
+def _coerce_rate_limit_reset_epoch_s(value: object) -> float | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        timestamp = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if timestamp <= 0:
+        return None
+    # OpenRouter surfaces X-RateLimit-Reset in Unix milliseconds.
+    if timestamp >= 10_000_000_000:
+        timestamp /= 1000.0
+    return timestamp
+
+
+def _lookup_header_value(headers: object, header_name: str) -> object | None:
+    if not isinstance(headers, dict):
+        return None
+    target = header_name.strip().lower()
+    for key, value in headers.items():
+        if str(key).strip().lower() == target:
+            return value
+    return None
+
+
+def _extract_rate_limit_reset_epoch_s(exc: Exception) -> float | None:
+    header_name = "X-RateLimit-Reset"
+
+    direct_headers = _lookup_header_value(getattr(exc, "headers", None), header_name)
+    direct_epoch = _coerce_rate_limit_reset_epoch_s(direct_headers)
+    if direct_epoch is not None:
+        return direct_epoch
+
+    response = getattr(exc, "response", None)
+    response_headers = _lookup_header_value(getattr(response, "headers", None), header_name)
+    response_epoch = _coerce_rate_limit_reset_epoch_s(response_headers)
+    if response_epoch is not None:
+        return response_epoch
+
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error_block = body.get("error")
+        if isinstance(error_block, dict):
+            metadata = error_block.get("metadata")
+            if isinstance(metadata, dict):
+                metadata_headers = _lookup_header_value(metadata.get("headers"), header_name)
+                metadata_epoch = _coerce_rate_limit_reset_epoch_s(metadata_headers)
+                if metadata_epoch is not None:
+                    return metadata_epoch
+
+    text = f"{type(exc).__name__}: {exc}"
+    match = re.search(r"['\"]x-ratelimit-reset['\"]\s*:\s*['\"]?(\d{10,16})['\"]?", text, re.IGNORECASE)
+    if match is None:
+        return None
+    return _coerce_rate_limit_reset_epoch_s(match.group(1))
+
+
+def _retry_sleep_seconds(exc: Exception, attempt_index: int) -> float:
+    sleep_s = min(3.0, _REQUEST_RETRY_BASE_BACKOFF_S * (2**attempt_index))
+    reset_epoch_s = _extract_rate_limit_reset_epoch_s(exc)
+    if reset_epoch_s is None:
+        return sleep_s
+
+    until_reset_s = max(0.0, reset_epoch_s - time.time()) + _RATE_LIMIT_RESET_BUFFER_S
+    if until_reset_s <= 0:
+        return sleep_s
+    return max(sleep_s, min(_RATE_LIMIT_RESET_MAX_SLEEP_S, until_reset_s))
+
+
+def _empty_response_sleep_seconds(attempt_index: int) -> float:
+    return min(2.0, _REQUEST_RETRY_BASE_BACKOFF_S * (2**attempt_index))
+
+
+def _should_attempt_stream(endpoint: LLMEndpoint) -> bool:
+    # OpenRouter frequently returns empty streamed chunks while non-stream still succeeds.
+    return endpoint.provider != "openrouter"
+
+
+def _openrouter_reasoning_disabled_base(base: dict[str, Any]) -> dict[str, Any]:
+    variant = dict(base)
+    variant.pop("reasoning_effort", None)
+    variant["extra_body"] = _merge_extra_body(
+        variant.get("extra_body") if isinstance(variant.get("extra_body"), dict) else None,
+        {"reasoning": {"effort": "none", "exclude": True}},
+    )
+    return variant
+
+
+def _augment_openrouter_attempts(base: dict[str, Any], attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    no_reasoning_base = _openrouter_reasoning_disabled_base(base)
+    return attempts + _build_request_attempts(no_reasoning_base)
+
+
+def _empty_response_error(response: Any) -> str:
+    finish_reason = None
+    provider_name = getattr(response, "provider", None)
+    reasoning_present = False
+    try:
+        choice = response.choices[0]
+        finish_reason = getattr(choice, "finish_reason", None)
+        message = getattr(choice, "message", None)
+        reasoning_present = bool(_extract_text_payload(getattr(message, "reasoning", None)).strip())
+    except Exception:  # noqa: BLE001
+        pass
+
+    details: list[str] = []
+    if finish_reason:
+        details.append(f"finish_reason={finish_reason}")
+    if provider_name:
+        details.append(f"provider={provider_name}")
+    if reasoning_present:
+        details.append("reasoning_only=true")
+
+    if details:
+        return "Empty model response. " + " ".join(details)
+    return "Empty model response."
+
+
+def _should_retry_same_empty_response(response: Any) -> bool:
+    try:
+        choice = response.choices[0]
+        finish_reason = str(getattr(choice, "finish_reason", "") or "").strip().lower()
+        message = getattr(choice, "message", None)
+    except Exception:  # noqa: BLE001
+        return True
+
+    if finish_reason == "length":
+        return False
+
+    reasoning_text = _extract_text_payload(getattr(message, "reasoning", None)).strip()
+    return not reasoning_text
+
+
 def _chat_create_with_retries(
     *,
     client: OpenAI,
@@ -299,7 +463,7 @@ def _chat_create_with_retries(
             if is_last_attempt or not _is_transient_request_error(last_error):
                 raise last_error
 
-            sleep_s = min(3.0, _REQUEST_RETRY_BASE_BACKOFF_S * (2**attempt_index))
+            sleep_s = _retry_sleep_seconds(last_error, attempt_index)
             time.sleep(sleep_s)
 
     if last_error is not None:
@@ -374,92 +538,52 @@ def _call_model_once(
             "timeout": timeout_s,
             "max_completion_tokens": max_completion_tokens,
         }
+        model_extra_body = extra_body_for_model(endpoint.request_model)
+        if model_extra_body is not None:
+            request_base["extra_body"] = model_extra_body
         if reasoning_effort:
             request_base["reasoning_effort"] = reasoning_effort
         if temperature is not None:
             request_base["temperature"] = temperature
-
-        stream_attempt = dict(request_base)
-        stream_attempt["stream"] = True
-        stream_attempt["stream_options"] = {"include_usage": True}
 
         start = time.perf_counter()
         fragments: list[str] = []
         ttft_s: float | None = None
         usage = UsageStats()
 
-        stream_error: str | None = None
+        stream_error: str | None = "stream disabled for provider"
         stream = None
-        try:
-            stream = _chat_create_with_retries(client=client, request_payload=stream_attempt)
-            for chunk in stream:
-                now = time.perf_counter()
-                if now - start > timeout_s:
-                    raise TimeoutError(f"stream response exceeded timeout_s={timeout_s}")
-                raw_chunk_usage = getattr(chunk, "usage", None)
-                if raw_chunk_usage is not None:
-                    usage = _extract_usage(raw_chunk_usage)
-
-                choices = getattr(chunk, "choices", None)
-                if not choices:
-                    continue
-                delta = getattr(choices[0], "delta", None)
-                content = getattr(delta, "content", None) if delta is not None else None
-                text_piece = _extract_text_payload(content)
-                if text_piece:
-                    fragments.append(text_piece)
-                    if ttft_s is None:
-                        ttft_s = now - start
-
-            total_latency_s = time.perf_counter() - start
-            output_text = "".join(fragments).strip()
-
-            if _stream_output_requires_retry(output_text):
-                stream_error = "stream output incomplete; retrying non-stream request"
-                raise RuntimeError(stream_error)
-
-            completion_tokens = usage.llm_completion_tokens
-            tokens_per_s = (
-                (completion_tokens / total_latency_s)
-                if completion_tokens > 0 and total_latency_s > 0
-                else None
-            )
-
-            if ttft_s is None:
-                ttft_s = total_latency_s
-
-            return InferenceResult(
-                output_text=output_text,
-                ttft_s=ttft_s,
-                total_latency_s=total_latency_s,
-                tokens_per_s=tokens_per_s,
-                usage=usage,
-            )
-        except Exception as stream_exc:  # noqa: BLE001
-            # Fall back to non-stream request for providers that do not support stream semantics.
-            stream_error = f"{type(stream_exc).__name__}: {stream_exc}"
-        finally:
-            close_fn = getattr(stream, "close", None)
-            if callable(close_fn):
-                try:
-                    close_fn()
-                except Exception:  # noqa: BLE001
-                    pass
-
-        attempts = _build_request_attempts(request_base)
-        last_error = stream_error
-        for attempt in attempts:
+        if _should_attempt_stream(endpoint):
+            stream_attempt = dict(request_base)
+            stream_attempt["stream"] = True
+            stream_attempt["stream_options"] = {"include_usage": True}
             try:
-                started = time.perf_counter()
-                response = _chat_create_with_retries(client=client, request_payload=attempt)
-                total_latency_s = time.perf_counter() - started
+                stream = _chat_create_with_retries(client=client, request_payload=stream_attempt)
+                for chunk in stream:
+                    now = time.perf_counter()
+                    if now - start > timeout_s:
+                        raise TimeoutError(f"stream response exceeded timeout_s={timeout_s}")
+                    raw_chunk_usage = getattr(chunk, "usage", None)
+                    if raw_chunk_usage is not None:
+                        usage = _extract_usage(raw_chunk_usage)
 
-                message = response.choices[0].message
-                output_text = _extract_text_payload(message.content).strip()
-                if not output_text:
-                    last_error = "Empty model response."
-                    continue
-                usage = _extract_usage(getattr(response, "usage", None))
+                    choices = getattr(chunk, "choices", None)
+                    if not choices:
+                        continue
+                    delta = getattr(choices[0], "delta", None)
+                    content = getattr(delta, "content", None) if delta is not None else None
+                    text_piece = _extract_text_payload(content)
+                    if text_piece:
+                        fragments.append(text_piece)
+                        if ttft_s is None:
+                            ttft_s = now - start
+
+                total_latency_s = time.perf_counter() - start
+                output_text = "".join(fragments).strip()
+
+                if _stream_output_requires_retry(output_text):
+                    stream_error = "stream output incomplete; retrying non-stream request"
+                    raise RuntimeError(stream_error)
 
                 completion_tokens = usage.llm_completion_tokens
                 tokens_per_s = (
@@ -468,15 +592,67 @@ def _call_model_once(
                     else None
                 )
 
+                if ttft_s is None:
+                    ttft_s = total_latency_s
+
                 return InferenceResult(
                     output_text=output_text,
-                    ttft_s=total_latency_s,
+                    ttft_s=ttft_s,
                     total_latency_s=total_latency_s,
                     tokens_per_s=tokens_per_s,
                     usage=usage,
                 )
-            except Exception as exc:  # noqa: BLE001
-                last_error = f"{type(exc).__name__}: {exc}"
+            except Exception as stream_exc:  # noqa: BLE001
+                # Fall back to non-stream request for providers that do not support stream semantics.
+                stream_error = f"{type(stream_exc).__name__}: {stream_exc}"
+            finally:
+                close_fn = getattr(stream, "close", None)
+                if callable(close_fn):
+                    try:
+                        close_fn()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        attempts = _build_request_attempts(request_base)
+        if endpoint.provider == "openrouter":
+            attempts = _augment_openrouter_attempts(request_base, attempts)
+        last_error = stream_error
+        for attempt in attempts:
+            for empty_attempt_index in range(_EMPTY_RESPONSE_RETRY_ATTEMPTS):
+                try:
+                    started = time.perf_counter()
+                    response = _chat_create_with_retries(client=client, request_payload=attempt)
+                    total_latency_s = time.perf_counter() - started
+
+                    message = response.choices[0].message
+                    output_text = _extract_message_output_text(message)
+                    if not output_text:
+                        last_error = _empty_response_error(response)
+                        is_last_empty_attempt = empty_attempt_index >= (_EMPTY_RESPONSE_RETRY_ATTEMPTS - 1)
+                        if is_last_empty_attempt or not _should_retry_same_empty_response(response):
+                            break
+
+                        time.sleep(_empty_response_sleep_seconds(empty_attempt_index))
+                        continue
+                    usage = _extract_usage(getattr(response, "usage", None))
+
+                    completion_tokens = usage.llm_completion_tokens
+                    tokens_per_s = (
+                        (completion_tokens / total_latency_s)
+                        if completion_tokens > 0 and total_latency_s > 0
+                        else None
+                    )
+
+                    return InferenceResult(
+                        output_text=output_text,
+                        ttft_s=total_latency_s,
+                        total_latency_s=total_latency_s,
+                        tokens_per_s=tokens_per_s,
+                        usage=usage,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    last_error = f"{type(exc).__name__}: {exc}"
+                    break
 
         return InferenceResult(
             output_text="",

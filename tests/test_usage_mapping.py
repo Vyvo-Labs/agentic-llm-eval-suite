@@ -19,10 +19,12 @@ from llm_eval_suite.models import (
 )
 from llm_eval_suite.providers import LLMEndpoint
 from llm_eval_suite.runner import (
+    _augment_openrouter_attempts,
     _build_request_attempts,
     _call_model_once,
     _extract_usage,
     _model_case_worker,
+    _should_attempt_stream,
     _stream_output_requires_retry,
 )
 
@@ -331,6 +333,55 @@ def test_call_model_once_computes_throughput_from_llm_completion_tokens(
     assert fake_completions.calls[0]["stream"] is True
 
 
+def test_call_model_once_applies_qwen_27b_non_thinking_extra_body(
+    monkeypatch: object,
+) -> None:
+    class _FakeCompletions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, **kwargs: object) -> object:
+            self.calls.append(dict(kwargs))
+            if kwargs.get("stream"):
+                raise RuntimeError("stream unsupported")
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+                usage={"llm_completion_tokens": 8},
+            )
+
+    fake_completions = _FakeCompletions()
+
+    class _FakeOpenAI:
+        def __init__(self, **_: object) -> None:
+            self.chat = SimpleNamespace(completions=fake_completions)
+
+    monkeypatch.setattr(runner_mod, "OpenAI", _FakeOpenAI)
+
+    for provider in ("openai", "openrouter"):
+        endpoint = LLMEndpoint(
+            provider=provider,
+            configured_model="Qwen/Qwen3.5-27B",
+            request_model="Qwen/Qwen3.5-27B",
+            base_url="http://localhost:8000/v1",
+            api_key_env="OPENAI_API_KEY",
+            api_key="sk-test",
+        )
+        _call_model_once(
+            endpoint=endpoint,
+            messages=[{"role": "user", "content": "hello"}],
+            timeout_s=5.0,
+            max_completion_tokens=32,
+            reasoning_effort=None,
+            temperature=None,
+        )
+
+    assert len(fake_completions.calls) >= 2
+    assert all(
+        call.get("extra_body") == {"chat_template_kwargs": {"enable_thinking": False}}
+        for call in fake_completions.calls
+    )
+
+
 def test_stream_output_requires_retry_for_empty_or_unclosed_fence() -> None:
     assert _stream_output_requires_retry("") is True
     assert _stream_output_requires_retry("```json\n{\"result\": 1}\n") is True
@@ -525,6 +576,208 @@ def test_call_model_once_retries_when_non_stream_response_is_empty(
     assert len(fake_completions.calls) >= 3
 
 
+def test_call_model_once_retries_same_payload_after_empty_non_stream_response(
+    monkeypatch: object,
+) -> None:
+    class _FakeCompletions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+            self.non_stream_calls = 0
+
+        def create(self, **kwargs: object) -> object:
+            self.calls.append(dict(kwargs))
+            if kwargs.get("stream"):
+                raise RuntimeError("stream unsupported")
+
+            self.non_stream_calls += 1
+            if self.non_stream_calls == 1:
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content=""))],
+                    usage={"completion_tokens": 0},
+                )
+
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="retry success"))],
+                usage={"completion_tokens": 5},
+            )
+
+    fake_completions = _FakeCompletions()
+    sleep_calls: list[float] = []
+
+    class _FakeOpenAI:
+        def __init__(self, **_: object) -> None:
+            self.chat = SimpleNamespace(completions=fake_completions)
+
+    monkeypatch.setattr(runner_mod, "OpenAI", _FakeOpenAI)
+    monkeypatch.setattr(runner_mod.time, "sleep", lambda value: sleep_calls.append(float(value)))
+
+    result = _call_model_once(
+        endpoint=_endpoint(),
+        messages=[{"role": "user", "content": "hello"}],
+        timeout_s=5.0,
+        max_completion_tokens=32,
+        reasoning_effort=None,
+        temperature=None,
+    )
+
+    assert result.output_text == "retry success"
+    assert result.usage.llm_completion_tokens == 5
+    assert fake_completions.non_stream_calls == 2
+    assert sleep_calls == [0.6]
+    assert fake_completions.calls[1]["max_completion_tokens"] == 32
+    assert fake_completions.calls[2]["max_completion_tokens"] == 32
+
+
+def test_call_model_once_uses_refusal_text_when_content_is_empty(
+    monkeypatch: object,
+) -> None:
+    class _FakeCompletions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, **kwargs: object) -> object:
+            self.calls.append(dict(kwargs))
+            if kwargs.get("stream"):
+                raise RuntimeError("stream unsupported")
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=None, refusal="I can't help with that.")
+                    )
+                ],
+                usage={"completion_tokens": 4},
+            )
+
+    fake_completions = _FakeCompletions()
+
+    class _FakeOpenAI:
+        def __init__(self, **_: object) -> None:
+            self.chat = SimpleNamespace(completions=fake_completions)
+
+    monkeypatch.setattr(runner_mod, "OpenAI", _FakeOpenAI)
+
+    result = _call_model_once(
+        endpoint=_endpoint(),
+        messages=[{"role": "user", "content": "hello"}],
+        timeout_s=5.0,
+        max_completion_tokens=32,
+        reasoning_effort=None,
+        temperature=None,
+    )
+
+    assert result.output_text == "I can't help with that."
+    assert result.usage.llm_completion_tokens == 4
+
+
+def test_call_model_once_skips_stream_for_openrouter(
+    monkeypatch: object,
+) -> None:
+    class _FakeCompletions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, **kwargs: object) -> object:
+            self.calls.append(dict(kwargs))
+            if kwargs.get("stream"):
+                raise AssertionError("stream should be disabled for openrouter")
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))],
+                usage={"completion_tokens": 3},
+            )
+
+    fake_completions = _FakeCompletions()
+
+    class _FakeOpenAI:
+        def __init__(self, **_: object) -> None:
+            self.chat = SimpleNamespace(completions=fake_completions)
+
+    endpoint = LLMEndpoint(
+        provider="openrouter",
+        configured_model="z-ai/glm-5",
+        request_model="z-ai/glm-5",
+        base_url="https://openrouter.ai/api/v1",
+        api_key_env="OPENROUTER_API_KEY",
+        api_key="or-test",
+    )
+
+    monkeypatch.setattr(runner_mod, "OpenAI", _FakeOpenAI)
+
+    result = _call_model_once(
+        endpoint=endpoint,
+        messages=[{"role": "user", "content": "hello"}],
+        timeout_s=5.0,
+        max_completion_tokens=32,
+        reasoning_effort=None,
+        temperature=None,
+    )
+
+    assert result.output_text == "ok"
+    assert len(fake_completions.calls) == 1
+    assert "stream" not in fake_completions.calls[0]
+
+
+def test_call_model_once_uses_openrouter_reasoning_disabled_fallback_after_reasoning_only_empty_response(
+    monkeypatch: object,
+) -> None:
+    class _FakeCompletions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, **kwargs: object) -> object:
+            self.calls.append(dict(kwargs))
+            extra_body = kwargs.get("extra_body") or {}
+            reasoning = extra_body.get("reasoning") if isinstance(extra_body, dict) else None
+            if reasoning == {"effort": "none", "exclude": True}:
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content="{\"result\":57}"))],
+                    usage={"completion_tokens": 5},
+                    provider="Ambient",
+                )
+
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="length",
+                        message=SimpleNamespace(content="", reasoning="hidden chain-of-thought"),
+                    )
+                ],
+                usage={"completion_tokens": 32},
+                provider="Ambient",
+            )
+
+    fake_completions = _FakeCompletions()
+
+    class _FakeOpenAI:
+        def __init__(self, **_: object) -> None:
+            self.chat = SimpleNamespace(completions=fake_completions)
+
+    endpoint = LLMEndpoint(
+        provider="openrouter",
+        configured_model="z-ai/glm-5",
+        request_model="z-ai/glm-5",
+        base_url="https://openrouter.ai/api/v1",
+        api_key_env="OPENROUTER_API_KEY",
+        api_key="or-test",
+    )
+
+    monkeypatch.setattr(runner_mod, "OpenAI", _FakeOpenAI)
+
+    result = _call_model_once(
+        endpoint=endpoint,
+        messages=[{"role": "user", "content": "hello"}],
+        timeout_s=5.0,
+        max_completion_tokens=32,
+        reasoning_effort=None,
+        temperature=None,
+    )
+
+    assert result.output_text == "{\"result\":57}"
+    assert any(
+        (call.get("extra_body") or {}).get("reasoning") == {"effort": "none", "exclude": True}
+        for call in fake_completions.calls
+    )
+
+
 def test_call_model_once_retries_transient_rate_limit_error(
     monkeypatch: object,
 ) -> None:
@@ -572,6 +825,64 @@ def test_call_model_once_retries_transient_rate_limit_error(
     assert fake_completions.non_stream_calls == 2
 
 
+def test_call_model_once_waits_for_rate_limit_reset_header(
+    monkeypatch: object,
+) -> None:
+    class _FakeRateLimitError(RuntimeError):
+        def __init__(self) -> None:
+            super().__init__("RateLimitError: Error code: 429 - free-models-per-min")
+            self.body = {
+                "error": {
+                    "message": "Rate limit exceeded: free-models-per-min.",
+                    "metadata": {"headers": {"X-RateLimit-Reset": "1773303300000"}},
+                }
+            }
+
+    class _FakeCompletions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+            self.non_stream_calls = 0
+
+        def create(self, **kwargs: object) -> object:
+            self.calls.append(dict(kwargs))
+            if kwargs.get("stream"):
+                raise RuntimeError("stream unsupported")
+
+            self.non_stream_calls += 1
+            if self.non_stream_calls == 1:
+                raise _FakeRateLimitError()
+
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="retry success"))],
+                usage={"completion_tokens": 7},
+            )
+
+    fake_completions = _FakeCompletions()
+    sleep_calls: list[float] = []
+
+    class _FakeOpenAI:
+        def __init__(self, **_: object) -> None:
+            self.chat = SimpleNamespace(completions=fake_completions)
+
+    monkeypatch.setattr(runner_mod, "OpenAI", _FakeOpenAI)
+    monkeypatch.setattr(runner_mod.time, "time", lambda: 1773303240.0)
+    monkeypatch.setattr(runner_mod.time, "sleep", lambda value: sleep_calls.append(float(value)))
+
+    result = _call_model_once(
+        endpoint=_endpoint(),
+        messages=[{"role": "user", "content": "hello"}],
+        timeout_s=5.0,
+        max_completion_tokens=32,
+        reasoning_effort=None,
+        temperature=None,
+    )
+
+    assert result.output_text == "retry success"
+    assert result.usage.llm_completion_tokens == 7
+    assert fake_completions.non_stream_calls == 2
+    assert sleep_calls == [60.25]
+
+
 def test_build_request_attempts_includes_boosted_max_tokens_fallback() -> None:
     attempts = _build_request_attempts(
         {
@@ -586,3 +897,47 @@ def test_build_request_attempts_includes_boosted_max_tokens_fallback() -> None:
     assert 512 in max_tokens_values
     assert 1024 in max_tokens_values
     assert 2048 in max_tokens_values
+
+
+def test_build_request_attempts_includes_boosted_max_tokens_without_reasoning_effort() -> None:
+    attempts = _build_request_attempts(
+        {
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "timeout": 5,
+            "max_completion_tokens": 256,
+        }
+    )
+    max_tokens_values = [a.get("max_tokens") for a in attempts if "max_tokens" in a]
+    assert 256 in max_tokens_values
+    assert 1024 in max_tokens_values
+    assert 2048 in max_tokens_values
+
+
+def test_augment_openrouter_attempts_appends_reasoning_disabled_variants() -> None:
+    base = {
+        "model": "z-ai/glm-5",
+        "messages": [{"role": "user", "content": "hi"}],
+        "timeout": 5,
+        "max_completion_tokens": 256,
+    }
+    attempts = _augment_openrouter_attempts(base, _build_request_attempts(base))
+    assert any(
+        (attempt.get("extra_body") or {}).get("reasoning") == {"effort": "none", "exclude": True}
+        for attempt in attempts
+    )
+
+
+def test_should_attempt_stream_is_disabled_for_openrouter() -> None:
+    openrouter_endpoint = LLMEndpoint(
+        provider="openrouter",
+        configured_model="z-ai/glm-5",
+        request_model="z-ai/glm-5",
+        base_url="https://openrouter.ai/api/v1",
+        api_key_env="OPENROUTER_API_KEY",
+        api_key="or-test",
+    )
+    openai_endpoint = _endpoint()
+
+    assert _should_attempt_stream(openrouter_endpoint) is False
+    assert _should_attempt_stream(openai_endpoint) is True

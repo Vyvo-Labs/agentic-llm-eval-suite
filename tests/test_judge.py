@@ -154,6 +154,47 @@ def test_request_judgment_falls_back_from_reasoning_and_legacy_tokens() -> None:
     assert "max_tokens" in completions.calls[2]
 
 
+def test_request_judgment_applies_qwen_27b_non_thinking_extra_body() -> None:
+    endpoint = LLMEndpoint(
+        provider="openai",
+        configured_model="Qwen/Qwen3.5-27B",
+        request_model="Qwen/Qwen3.5-27B",
+        base_url=None,
+        api_key_env="OPENAI_API_KEY",
+        api_key="sk-test",
+    )
+    judge = LLMJudge(
+        endpoint=endpoint,
+        config=JudgeRuntimeConfig(timeout_s=5.0, max_completion_tokens=128, reasoning_effort=None),
+    )
+
+    class _FakeCompletions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, **kwargs: object) -> object:
+            self.calls.append(dict(kwargs))
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content='{"final_score":0.6,"flags":[],"rationale":"ok","criterion_scores":[]}'
+                        )
+                    )
+                ]
+            )
+
+    completions = _FakeCompletions()
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    response_text, error = judge._request_judgment(client=fake_client, prompt="judge prompt")
+
+    assert error is None
+    assert '"final_score":0.6' in response_text
+    assert len(completions.calls) >= 1
+    assert completions.calls[0]["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+
+
 def test_evaluate_returns_unavailable_when_judge_endpoint_missing() -> None:
     judge = LLMJudge(
         endpoint=None,

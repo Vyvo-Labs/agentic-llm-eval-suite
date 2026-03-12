@@ -14,7 +14,7 @@ from .models import (
     JudgeCriterionScore,
     JudgeScore,
 )
-from .providers import LLMEndpoint
+from .providers import LLMEndpoint, extra_body_for_model
 
 
 @dataclass(slots=True)
@@ -110,6 +110,9 @@ class LLMJudge:
             "timeout": self._config.timeout_s,
             "max_completion_tokens": self._config.max_completion_tokens,
         }
+        model_extra_body = extra_body_for_model(self._endpoint.request_model)
+        if model_extra_body is not None:
+            params["extra_body"] = model_extra_body
         if self._config.reasoning_effort:
             params["reasoning_effort"] = self._config.reasoning_effort
 

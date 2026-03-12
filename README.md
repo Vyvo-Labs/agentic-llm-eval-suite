@@ -131,32 +131,21 @@ Default OpenAI preset models:
 - `gpt-5.2`
 - `gpt-5-mini/minimal`
 - `gpt-5.2/none`
+- `Qwen/Qwen3.5-27B`
 
 Default OpenRouter preset models:
-- `moonshotai/kimi-k2.5`
 - `z-ai/glm-5`
-- `z-ai/glm-4.7`
 - `google/gemini-3.1-flash-lite-preview`
-- `qwen/qwen3.5-397b-a17b`
 - `qwen/qwen3.5-35b-a3b`
-- `qwen/qwen3.5-27b`
+- `nvidia/nemotron-3-super-120b-a12b:free`
+- `Qwen/Qwen3.5-27B`
 - `deepseek/deepseek-v3.2`
 - `anthropic/claude-haiku-4.5`
-- `anthropic/claude-sonnet-4.5`
-- `anthropic/claude-opus-4.5`
 - `openai/gpt-5-mini/minimal`
 - `openai/gpt-5.3-chat`
 - `openai/gpt-5.2`
 - `openai/gpt-5.2/none`
-- `openai/gpt-4.1`
 - `openai/gpt-4.1-mini`
-- `z-ai/glm-4.7-flash`
-- `MiniMaxAI/MiniMax-M2.5`
-- `minimax/minimax-m2-her`
-- `stepfun/step-3.5-flash`
-- `xiaomi/mimo-v2-flash`
-- `nvidia/nemotron-3-nano-30b-a3b`
-- `meituan/longcat-flash-chat`
 
 ### Runtime
 
@@ -169,6 +158,7 @@ Default OpenRouter preset models:
 - You can encode reasoning effort in model names with a suffix tag:
   - `gpt-5-mini/minimal`
   - `openai/gpt-5.2/none`
+- For `Qwen/Qwen3.5-27B`, the suite automatically sets `extra_body.chat_template_kwargs.enable_thinking=false`.
 - Legacy aliases still work:
   - `openai-5.2-none` and `openai/gpt-5.2-none` -> `reasoning_effort=none`
   - `openai-5-mini-minimal` and `openai/gpt-5-mini-minimal` -> `reasoning_effort=minimal`
@@ -190,6 +180,7 @@ Default OpenRouter preset models:
 ### Provider keys
 
 - `OPENAI_API_KEY`
+- `OPENAI_BASE_URL` (optional OpenAI-compatible base URL; `/v1/chat/completions` is normalized to `/v1`)
 - `GROQ_API_KEY`
 - `OPENROUTER_API_KEY`
 - `FIREWORKS_API_KEY`
